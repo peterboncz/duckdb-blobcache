@@ -1,0 +1,17 @@
+# name: test/sql/blobcache.test
+# description: test blobcache extension
+# group: [sql]
+
+require blobcache
+
+statement ok
+install httpfs
+
+statement ok
+load httpfs
+
+# Test filesystem wrapping functionality
+query I
+SELECT count(*) FROM 'https://raw.githubusercontent.com/duckdb/duckdb/refs/heads/main/data/csv/weather.csv' LIMIT 1
+----
+366
