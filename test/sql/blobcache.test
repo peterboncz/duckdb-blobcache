@@ -10,8 +10,34 @@ install httpfs
 statement ok
 load httpfs
 
-# Test filesystem wrapping functionality
+# Test that blobcache extension is properly loaded and table functions work
+query I
+CALL blobcache_init('/tmp/blobcache_test', 256);
+----
+true
+
+# Test that blobcache_stats table function works (should return empty initially)
+statement ok
+FROM blobcache_stats();
+
+# Test filesystem wrapper integration with cache
 query I
 SELECT count(*) FROM 'https://raw.githubusercontent.com/duckdb/duckdb/refs/heads/main/data/csv/weather.csv' LIMIT 1
 ----
 366
+
+# Wait for background cache processing
+statement ok
+SELECT count(*) FROM range(1000000)
+
+# Verify that cache statistics show the cached data
+query I
+SELECT count(*) FROM blobcache_stats() WHERE filename LIKE '%weather.csv%'
+----
+1
+
+# Verify that cache data was actually stored 
+query I  
+SELECT CASE WHEN start >= 0 AND "end" > start THEN 1 ELSE 0 END as valid_range FROM blobcache_stats() WHERE filename LIKE '%weather.csv%'
+----
+1
