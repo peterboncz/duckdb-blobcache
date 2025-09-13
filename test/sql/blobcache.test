@@ -10,11 +10,10 @@ install httpfs
 statement ok
 load httpfs
 
-# Test that blobcache extension is properly loaded and table functions work
-query I
-CALL blobcache_init('/tmp/blobcache_test', 256);
-----
-true
+# Test that blobcache extension is properly loaded and table functions work  
+# Enable aggressive mode to cache CSV files (conservative mode by default only caches parquet)
+statement ok
+CALL blobcache_config('/tmp/blobcache_test', 256, 1, '\.csv$');
 
 # Test that blobcache_stats table function works (should return empty initially)
 statement ok

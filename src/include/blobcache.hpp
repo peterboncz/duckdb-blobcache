@@ -28,6 +28,7 @@
 #include <queue>
 #include <condition_variable>
 #include <atomic>
+#include <regex>
 
 namespace duckdb {
 
@@ -185,18 +186,64 @@ public:
 //===----------------------------------------------------------------------===//
 // Cache data structures
 //===----------------------------------------------------------------------===//
+// Wrapper to manage shared buffer allocation
+struct SharedBuffer {
+	unique_ptr<char[]> data;
+	explicit SharedBuffer(idx_t size) : data(new char[size]) {}
+};
+
 struct CacheRange {
 	idx_t start, end; // range in original file
 	idx_t file_offset;  // Offset in the cache file where this range is stored
-	mutable idx_t usage_count = 0;
-	mutable idx_t bytes_from_cache = 0;
-	unique_ptr<char[]> memory_buffer;  // Temporary in-memory buffer until disk write completes
+	mutable std::atomic<idx_t> usage_count{0};  // Thread-safe statistics
+	mutable std::atomic<idx_t> bytes_from_cache{0};  // Thread-safe statistics
+	duckdb::shared_ptr<SharedBuffer> memory_buffer;  // Temporary in-memory buffer until disk write completes
 	bool disk_write_complete = false;  // Whether the background disk write has completed
 	
 	CacheRange() : start(0), end(0), file_offset(0) {} // Default constructor
 	CacheRange(idx_t start, idx_t end, idx_t file_offset) : start(start), end(end), file_offset(file_offset) {}
-	CacheRange(idx_t start, idx_t end, unique_ptr<char[]> buffer) 
+	CacheRange(idx_t start, idx_t end, duckdb::shared_ptr<SharedBuffer> buffer) 
 		: start(start), end(end), file_offset(0), memory_buffer(std::move(buffer)), disk_write_complete(false) {}
+		
+	// Copy constructor
+	CacheRange(const CacheRange& other) 
+		: start(other.start), end(other.end), file_offset(other.file_offset),
+		  usage_count(other.usage_count.load()), bytes_from_cache(other.bytes_from_cache.load()),
+		  memory_buffer(other.memory_buffer), disk_write_complete(other.disk_write_complete) {}
+		  
+	// Move constructor
+	CacheRange(CacheRange&& other) noexcept
+		: start(other.start), end(other.end), file_offset(other.file_offset),
+		  usage_count(other.usage_count.load()), bytes_from_cache(other.bytes_from_cache.load()),
+		  memory_buffer(std::move(other.memory_buffer)), disk_write_complete(other.disk_write_complete) {}
+		  
+	// Copy assignment
+	CacheRange& operator=(const CacheRange& other) {
+		if (this != &other) {
+			start = other.start;
+			end = other.end;
+			file_offset = other.file_offset;
+			usage_count.store(other.usage_count.load());
+			bytes_from_cache.store(other.bytes_from_cache.load());
+			memory_buffer = other.memory_buffer;
+			disk_write_complete = other.disk_write_complete;
+		}
+		return *this;
+	}
+	
+	// Move assignment
+	CacheRange& operator=(CacheRange&& other) noexcept {
+		if (this != &other) {
+			start = other.start;
+			end = other.end;
+			file_offset = other.file_offset;
+			usage_count.store(other.usage_count.load());
+			bytes_from_cache.store(other.bytes_from_cache.load());
+			memory_buffer = std::move(other.memory_buffer);
+			disk_write_complete = other.disk_write_complete;
+		}
+		return *this;
+	}
 };
 
 struct CacheWriteJob {
@@ -204,7 +251,7 @@ struct CacheWriteJob {
 	string filename;
 	idx_t start_pos;
 	idx_t end_pos;
-	unique_ptr<char[]> buffer;
+	duckdb::shared_ptr<SharedBuffer> buffer;
 	idx_t buffer_size;
 	idx_t file_offset;  // Will be set by the background writer
 };
@@ -212,7 +259,7 @@ struct CacheWriteJob {
 struct CacheEntry {
 	string filename;
 	map<idx_t, CacheRange> ranges;  // Map of start position to CacheRange
-	std::mutex ranges_mutex;  // Protects the ranges map and individual range statistics
+	mutable std::mutex ranges_mutex;  // Protects the ranges map and individual range statistics
 	idx_t cached_file_size = 0;  // Total bytes cached for this file
 };
 
@@ -235,6 +282,11 @@ private:
 	LRUCache lru_cache;
 	mutable std::mutex cache_mutex; // Protects key_cache, lru_cache, current_cache_size
 	
+	// Cached regex patterns for file filtering (updated via callback)
+	mutable std::mutex regex_mutex; // Protects cached regex state
+	vector<std::regex> cached_regexps; // Compiled regex patterns
+	bool conservative_mode; // True if blobcache_regexps is empty
+	
 	// Directory creation optimization
 	std::bitset<65536> subdirs_created; // Track which subdirectories have been created (16-bit hex = 65536 possibilities)
 	
@@ -253,10 +305,11 @@ private:
 	idx_t GetPartitionForKey(const string &cache_key) const;
 	
 	// Cache management helper methods
-	void EvictToCapacity(idx_t required_space);
+	bool EvictToCapacity(idx_t required_space, const string &exclude_key = "");
 	void EvictFile(const string &filename);
 	void EvictKey(const string &cache_key);
 	idx_t CalculateFileBytes(const string &cache_key);
+	bool HasUnfinishedWrites(const string &cache_key);
 	
 	// Cache key generation methods
 	string GenerateCacheKey(const string &filename);
@@ -280,8 +333,8 @@ public:
 	// Constructor/Destructor
 	explicit BlobCache(DatabaseInstance *db_instance = nullptr)
 	    : db_instance(db_instance), path_separator("/"), cache_capacity(DEFAULT_CACHE_CAPACITY), 
-	      current_cache_size(0), cache_initialized(false), shutdown_writer_threads(false), 
-	      database_shutting_down(false), num_writer_threads(1) {
+	      current_cache_size(0), cache_initialized(false), conservative_mode(true),
+	      shutdown_writer_threads(false), database_shutting_down(false), num_writer_threads(1) {
 		// Don't start the cache writer threads in constructor to avoid potential deadlocks
 		// They will be started when needed in InitializeCache
 	}
@@ -327,7 +380,26 @@ public:
 	
 	// Cache management
 	void InitializeCache(const string &directory, idx_t max_size_bytes, idx_t writer_threads = 1);
+	void ConfigureCache(const string &directory, idx_t max_size_bytes, idx_t writer_threads = 1);
 	bool IsCacheInitialized() const { return cache_initialized; }
+	
+	// Cache status getters (thread-safe)
+	string GetCachePath() const { 
+		std::lock_guard<std::mutex> lock(cache_mutex);
+		return cache_dir_path; 
+	}
+	idx_t GetMaxSizeBytes() const { 
+		std::lock_guard<std::mutex> lock(cache_mutex);
+		return cache_capacity; 
+	}
+	idx_t GetCurrentSizeBytes() const { 
+		std::lock_guard<std::mutex> lock(cache_mutex);
+		return current_cache_size; 
+	}
+	idx_t GetWriterThreadCount() const { 
+		std::lock_guard<std::mutex> lock(cache_mutex);
+		return num_writer_threads; 
+	}
 	
 	// Statistics structure
 	struct RangeInfo {
@@ -339,8 +411,14 @@ public:
 	};
 	
 	// Statistics
-	void PopulateCacheStatistics(DataChunk &output, idx_t max_results = 1000) const;
-	void PopulateCacheStatistics(vector<RangeInfo> &range_infos, idx_t max_results = 1000) const;
+	vector<RangeInfo> GetCacheStatistics(idx_t max_results = 10000) const;
+	
+	// Configuration and caching policy
+	bool ShouldCacheFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) const;
+	
+	// Regex pattern management
+	void UpdateRegexPatterns(const string &regex_patterns_str);
+	void PurgeCacheForPatternChange(optional_ptr<FileOpener> opener = nullptr);
 
 };
 

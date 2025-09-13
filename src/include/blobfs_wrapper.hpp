@@ -57,10 +57,6 @@ public:
 	bool IsCacheInitialized() const {
 		return cache->IsCacheInitialized();
 	}
-	
-	void PopulateCacheStatistics(DataChunk &output, idx_t limit = 1000) {
-		cache->PopulateCacheStatistics(output, limit);
-	}
 
 	// FileSystem interface implementation
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,

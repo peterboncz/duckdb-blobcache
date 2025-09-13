@@ -14,11 +14,17 @@ unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileO
                                                         optional_ptr<FileOpener> opener) {
 	auto wrapped_handle = wrapped_fs->OpenFile(path, flags, opener);
 	
+	// Check if we should enable caching for this file
 	if (cache->IsCacheInitialized() && flags.OpenForReading() && !flags.OpenForWriting()) {
-		string cache_key = path + ":" + wrapped_fs->GetName();
-		DUCKDB_LOG_DEBUG(*db_instance, "[BlobCache] File opened with caching enabled: path=%s, cache_key=%s", 
-		                  path.c_str(), cache_key.c_str());
-		return make_uniq<BlobFileHandle>(*this, std::move(wrapped_handle), cache_key, cache, db_instance);
+		if (cache->ShouldCacheFile(path, opener)) {
+			string cache_key = path + ":" + wrapped_fs->GetName();
+			DUCKDB_LOG_DEBUG(*db_instance, "[BlobCache] File opened with caching enabled: path=%s, cache_key=%s", 
+			                  path.c_str(), cache_key.c_str());
+			return make_uniq<BlobFileHandle>(*this, std::move(wrapped_handle), cache_key, cache, db_instance);
+		} else {
+			DUCKDB_LOG_DEBUG(*db_instance, "[BlobCache] File opened without caching (policy restriction): path=%s", 
+			                  path.c_str());
+		}
 	}
 	
 	return wrapped_handle;
@@ -125,10 +131,8 @@ void BlobFilesystemWrapper::Truncate(FileHandle &handle, int64_t new_size) {
 void BlobFilesystemWrapper::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
 	// Invalidate cache entries for both source and target
 	if (cache) {
-		string source_key = source + ":" + wrapped_fs->GetName();
-		string target_key = target + ":" + wrapped_fs->GetName();
-		cache->InvalidateCache(source_key);
-		cache->InvalidateCache(target_key);
+		cache->InvalidateCache(source + ":" + wrapped_fs->GetName());
+		cache->InvalidateCache(target + ":" + wrapped_fs->GetName());
 		if (cache->IsCacheInitialized()) {
 			DUCKDB_LOG_DEBUG(*db_instance, "[BlobCache] MoveFile called: source=%s, target=%s - Cache invalidated for both files", 
 			                  source.c_str(), target.c_str());
@@ -140,8 +144,7 @@ void BlobFilesystemWrapper::MoveFile(const string &source, const string &target,
 void BlobFilesystemWrapper::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
 	// Invalidate cache entries for this file
 	if (cache) {
-		string cache_key = filename + ":" + wrapped_fs->GetName();
-		cache->InvalidateCache(cache_key);
+		cache->InvalidateCache(filename + ":" + wrapped_fs->GetName());
 		if (cache->IsCacheInitialized()) {
 			DUCKDB_LOG_DEBUG(*db_instance, "[BlobCache] RemoveFile called: filename=%s - Cache invalidated", filename.c_str());
 		}
