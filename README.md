@@ -10,8 +10,10 @@ This blobcache can greatly expand how much data can be cached compared to the RA
 
 The blobcache uses simple synchronous I/O but tends to write largish sequential blocks, so that can still be efficient. It also employs writer background threads to do so.
 
-You can configure with: blobcache_config(directory, max_size_mb, num_writer_threads, regexps="")
+You can configure with: CALL blobcache_config(directory, max_size_mb, num_writer_threads, regexps="")
 You can inspect the configuration by invoking that without parameters.
 You can reconfigure an existing cache by changing all parameters except the first (the directory). If you change the directory (where the cached file ranges are stored), then the cache gets cleared.
+
+The current contents of the cache can be queried with FROM blobcache_stats();
 
 The regexps parameter contains semicolon-separated regexps that allow more aggresive caching: they will cache any URL that matches one of the regexps.
