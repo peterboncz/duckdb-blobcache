@@ -87,7 +87,7 @@ static void WrapExistingFilesystems(DatabaseInstance &instance) {
 		if (extracted_fs) {
 			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Successfully extracted subsystem: '%s' (GetName returns: '%s')", 
 			                  name.c_str(), extracted_fs->GetName().c_str());
-			auto wrapped_fs = make_uniq<BlobFilesystemWrapper>(std::move(extracted_fs), &instance, shared_cache);
+			auto wrapped_fs = make_uniq<BlobFilesystemWrapper>(std::move(extracted_fs), shared_cache);
 			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Created wrapper with name: '%s'", wrapped_fs->GetName().c_str());
 			vfs->RegisterSubSystem(std::move(wrapped_fs));
 			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Successfully registered wrapped subsystem for '%s'", name.c_str());

@@ -373,32 +373,33 @@ public:
 	
 	// Core cache operations
 	void InsertCache(const string &filename, idx_t start_pos, const void *buffer, int64_t length);
-	void InvalidateCache(const string &filename);
-	
 	// Combined cache lookup and read - returns bytes read from cache, adjusts nr_bytes if needed
 	idx_t ReadFromCache(const string &cache_key, idx_t position, void *buffer, idx_t &nr_bytes);
 	
 	// Cache management
+	void ClearCache() {
+		key_cache.clear();
+		lru_cache.Clear();
+		current_cache_size = 0;
+		subdirs_created.reset();
+	}
+	void InvalidateCache(const string &filename);
 	void InitializeCache(const string &directory, idx_t max_size_bytes, idx_t writer_threads = 1);
 	void ConfigureCache(const string &directory, idx_t max_size_bytes, idx_t writer_threads = 1);
 	bool IsCacheInitialized() const { return cache_initialized; }
 	
-	// Cache status getters (thread-safe)
+	// Cache status getters
 	string GetCachePath() const { 
-		std::lock_guard<std::mutex> lock(cache_mutex);
-		return cache_dir_path; 
+		return cache_dir_path;
 	}
 	idx_t GetMaxSizeBytes() const { 
-		std::lock_guard<std::mutex> lock(cache_mutex);
-		return cache_capacity; 
+		return cache_capacity;
 	}
 	idx_t GetCurrentSizeBytes() const { 
-		std::lock_guard<std::mutex> lock(cache_mutex);
-		return current_cache_size; 
+		return current_cache_size;
 	}
 	idx_t GetWriterThreadCount() const { 
-		std::lock_guard<std::mutex> lock(cache_mutex);
-		return num_writer_threads; 
+		return num_writer_threads;
 	}
 	
 	// Statistics structure
@@ -419,7 +420,6 @@ public:
 	// Regex pattern management
 	void UpdateRegexPatterns(const string &regex_patterns_str);
 	void PurgeCacheForPatternChange(optional_ptr<FileOpener> opener = nullptr);
-
 };
 
 } // namespace duckdb
