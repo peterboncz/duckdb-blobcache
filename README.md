@@ -12,6 +12,6 @@ The blobcache uses simple synchronous I/O but tends to write largish sequential 
 
 You can configure with: blobcache(directory, max_size_mb, num_writer_threads, regexps="")
 You can inspect the configuration by invoking that without parameters.
-You can reconfigure an existing cache by changijng all parameters except the first (the directory). If you change the directory, then the cache gets cleared.
+You can reconfigure an existing cache by changing all parameters except the first (the directory). If you change the directory (where the cached file ranges are stored), then the cache gets cleared.
 
 The regexps parameter contains semicolon-separated regexps that allow more aggresive caching: they will cache any URL that matches one of the regexps.
