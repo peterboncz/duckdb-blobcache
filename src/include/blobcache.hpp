@@ -193,72 +193,29 @@ struct SharedBuffer {
 };
 
 struct CacheRange {
-	idx_t start, end; // range in original file
-	idx_t file_offset;  // Offset in the cache file where this range is stored
-	mutable std::atomic<idx_t> usage_count{0};  // Thread-safe statistics
-	mutable std::atomic<idx_t> bytes_from_cache{0};  // Thread-safe statistics
+	idx_t start = 0;
+	idx_t end = 0;
+	idx_t file_offset = 0;  // Offset in the cache file where this range is stored
+	idx_t usage_count = 0;  // statistics - protected by ranges_mutex
+	idx_t bytes_from_cache = 0;  // statistics - protected by ranges_mutex
 	duckdb::shared_ptr<SharedBuffer> memory_buffer;  // Temporary in-memory buffer until disk write completes
 	bool disk_write_complete = false;  // Whether the background disk write has completed
-	
-	CacheRange() : start(0), end(0), file_offset(0) {} // Default constructor
-	CacheRange(idx_t start, idx_t end, idx_t file_offset) : start(start), end(end), file_offset(file_offset) {}
-	CacheRange(idx_t start, idx_t end, duckdb::shared_ptr<SharedBuffer> buffer) 
-		: start(start), end(end), file_offset(0), memory_buffer(std::move(buffer)), disk_write_complete(false) {}
-		
-	// Copy constructor
-	CacheRange(const CacheRange& other) 
-		: start(other.start), end(other.end), file_offset(other.file_offset),
-		  usage_count(other.usage_count.load()), bytes_from_cache(other.bytes_from_cache.load()),
-		  memory_buffer(other.memory_buffer), disk_write_complete(other.disk_write_complete) {}
-		  
-	// Move constructor
-	CacheRange(CacheRange&& other) noexcept
-		: start(other.start), end(other.end), file_offset(other.file_offset),
-		  usage_count(other.usage_count.load()), bytes_from_cache(other.bytes_from_cache.load()),
-		  memory_buffer(std::move(other.memory_buffer)), disk_write_complete(other.disk_write_complete) {}
-		  
-	// Copy assignment
-	CacheRange& operator=(const CacheRange& other) {
-		if (this != &other) {
-			start = other.start;
-			end = other.end;
-			file_offset = other.file_offset;
-			usage_count.store(other.usage_count.load());
-			bytes_from_cache.store(other.bytes_from_cache.load());
-			memory_buffer = other.memory_buffer;
-			disk_write_complete = other.disk_write_complete;
-		}
-		return *this;
-	}
-	
-	// Move assignment
-	CacheRange& operator=(CacheRange&& other) noexcept {
-		if (this != &other) {
-			start = other.start;
-			end = other.end;
-			file_offset = other.file_offset;
-			usage_count.store(other.usage_count.load());
-			bytes_from_cache.store(other.bytes_from_cache.load());
-			memory_buffer = std::move(other.memory_buffer);
-			disk_write_complete = other.disk_write_complete;
-		}
-		return *this;
-	}
-};
 
-struct CacheWriteJob {
-	string cache_key;
-	string filename;
-	idx_t start_pos;
-	idx_t end_pos;
-	duckdb::shared_ptr<SharedBuffer> buffer;
-	idx_t buffer_size;
-	idx_t file_offset;  // Will be set by the background writer
+	// Default constructor
+	CacheRange() = default;
+
+	// Constructor for disk-backed range
+	CacheRange(idx_t start, idx_t end, idx_t file_offset)
+		: start(start), end(end), file_offset(file_offset), disk_write_complete(true) {}
+
+	// Constructor for memory-backed range
+	CacheRange(idx_t start, idx_t end, duckdb::shared_ptr<SharedBuffer> buffer)
+		: start(start), end(end), file_offset(0), memory_buffer(std::move(buffer)), disk_write_complete(false) {}
 };
 
 struct CacheEntry {
 	string filename;
-	map<idx_t, CacheRange> ranges;  // Map of start position to CacheRange
+	map<idx_t, duckdb::shared_ptr<CacheRange>> ranges;  // Map of start position to shared CacheRange
 	mutable std::mutex ranges_mutex;  // Protects the ranges map and individual range statistics
 	idx_t cached_file_size = 0;  // Total bytes cached for this file
 };
@@ -293,7 +250,7 @@ private:
 	// Multi-threaded background cache writer system
 	static constexpr idx_t MAX_WRITER_THREADS = 256;
 	std::array<std::thread, MAX_WRITER_THREADS> cache_writer_threads;
-	std::array<std::queue<unique_ptr<CacheWriteJob>>, MAX_WRITER_THREADS> write_job_queues;
+	std::array<std::queue<pair<string, duckdb::shared_ptr<CacheRange>>>, MAX_WRITER_THREADS> write_job_queues;
 	std::array<std::mutex, MAX_WRITER_THREADS> write_queue_mutexes;
 	std::array<std::condition_variable, MAX_WRITER_THREADS> write_queue_cvs;
 	std::atomic<bool> shutdown_writer_threads;
@@ -301,7 +258,7 @@ private:
 	idx_t num_writer_threads;
 	
 	void CacheWriterThreadLoop(idx_t thread_id);
-	void QueueCacheWrite(unique_ptr<CacheWriteJob> job);
+	void QueueCacheWrite(const string &filename, duckdb::shared_ptr<CacheRange> range);
 	idx_t GetPartitionForKey(const string &cache_key) const;
 	
 	// Cache management helper methods
@@ -348,7 +305,6 @@ public:
 	// Thread management
 	void StartCacheWriterThreads(idx_t thread_count);
 	void StopCacheWriterThreads();
-	void ChangeWriterThreadCount(idx_t new_thread_count);
 	
 	// Logging methods with shutdown-safe null guards
 	void LogDebug(const string &message) const {
