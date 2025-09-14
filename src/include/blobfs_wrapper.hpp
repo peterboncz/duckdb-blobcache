@@ -3,6 +3,9 @@
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/common/virtual_file_system.hpp"
+#include "duckdb/common/opener_file_system.hpp"
 #include "blobcache.hpp"
 
 namespace duckdb {
@@ -10,6 +13,27 @@ namespace duckdb {
 // Forward declarations
 class BlobCache;
 class BlobFileHandle;
+
+//===----------------------------------------------------------------------===//
+// BlobCacheEntry - ObjectCache wrapper for BlobCache
+//===----------------------------------------------------------------------===//
+class BlobCacheEntry : public ObjectCacheEntry {
+public:
+	shared_ptr<BlobCache> cache;
+
+	explicit BlobCacheEntry(shared_ptr<BlobCache> cache_p) : cache(std::move(cache_p)) {}
+
+	string GetObjectType() override {
+		return "BlobCache";
+	}
+
+	static string ObjectType() {
+		return "BlobCache";
+	}
+
+	// ObjectCacheEntry is properly destructed automatically
+	~BlobCacheEntry() override = default;
+};
 
 //===----------------------------------------------------------------------===//
 // BlobFileHandle - wraps original file handles to intercept reads
@@ -170,5 +194,11 @@ private:
 	unique_ptr<FileSystem> wrapped_fs;
 	shared_ptr<BlobCache> cache;
 };
+
+// Cache management functions
+shared_ptr<BlobCache> GetOrCreateBlobCache(DatabaseInstance &instance);
+
+// Filesystem wrapping utility function
+void WrapExistingFilesystems(DatabaseInstance &instance);
 
 } // namespace duckdb

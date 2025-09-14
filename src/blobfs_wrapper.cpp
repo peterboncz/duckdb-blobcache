@@ -99,4 +99,84 @@ void BlobFilesystemWrapper::RemoveFile(const string &filename, optional_ptr<File
 	wrapped_fs->RemoveFile(filename, opener);
 }
 
+//===----------------------------------------------------------------------===//
+// Cache Management Functions
+//===----------------------------------------------------------------------===//
+shared_ptr<BlobCache> GetOrCreateBlobCache(DatabaseInstance &instance) {
+	auto &object_cache = instance.GetObjectCache();
+
+	// Try to get existing cache
+	auto cached_entry = object_cache.Get<BlobCacheEntry>("blobcache_instance");
+	if (cached_entry) {
+		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Retrieved existing BlobCache from ObjectCache");
+		return cached_entry->cache;
+	}
+
+	// Create new cache and store in ObjectCache
+	auto new_cache = make_shared_ptr<BlobCache>(&instance);
+	auto cache_entry = make_shared_ptr<BlobCacheEntry>(new_cache);
+	object_cache.Put("blobcache_instance", cache_entry);
+	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Created and stored new BlobCache in ObjectCache");
+
+	return new_cache;
+}
+
+void WrapExistingFilesystems(DatabaseInstance &instance) {
+	auto &db_fs = FileSystem::GetFileSystem(instance);
+	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Filesystem type: %s", db_fs.GetName().c_str());
+
+	// Get VirtualFileSystem
+	auto vfs = dynamic_cast<VirtualFileSystem*>(&db_fs);
+	if (!vfs) {
+		auto *opener_fs = dynamic_cast<OpenerFileSystem*>(&db_fs);
+		if (opener_fs) {
+			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Found OpenerFileSystem, getting wrapped VFS");
+			vfs = dynamic_cast<VirtualFileSystem*>(&opener_fs->GetFileSystem());
+		}
+	}
+	if (!vfs) {
+		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Cannot find VirtualFileSystem - skipping filesystem wrapping");
+		return;
+	}
+
+	// Get the shared cache instance - only proceed if cache is initialized
+	auto shared_cache = GetOrCreateBlobCache(instance);
+	if (!shared_cache->IsCacheInitialized()) {
+		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Cache not initialized yet, skipping filesystem wrapping");
+		return;
+	}
+	// Try to wrap each blob storage filesystem
+	auto subsystems = vfs->ListSubSystems();
+	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Found %zu registered subsystems", subsystems.size());
+
+	for (const auto &name : subsystems) {
+		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Processing subsystem: '%s'", name.c_str());
+
+		// Skip if already wrapped (starts with "BlobCache:")
+		if (name.find("BlobCache:") == 0) {
+			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Skipping already wrapped subsystem: '%s'", name.c_str());
+			continue;
+		}
+
+		auto extracted_fs = vfs->ExtractSubSystem(name);
+		if (extracted_fs) {
+			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Successfully extracted subsystem: '%s' (GetName returns: '%s')",
+			                  name.c_str(), extracted_fs->GetName().c_str());
+			auto wrapped_fs = make_uniq<BlobFilesystemWrapper>(std::move(extracted_fs), shared_cache);
+			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Created wrapper with name: '%s'", wrapped_fs->GetName().c_str());
+			vfs->RegisterSubSystem(std::move(wrapped_fs));
+			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Successfully registered wrapped subsystem for '%s'", name.c_str());
+		} else {
+			DUCKDB_LOG_ERROR(instance, "[BlobCache] Failed to extract '%s' - subsystem not wrapped", name.c_str());
+		}
+	}
+
+	// Log final subsystem list
+	auto final_subsystems = vfs->ListSubSystems();
+	DUCKDB_LOG_DEBUG(instance, "[BlobCache] After wrapping, have %zu subsystems", final_subsystems.size());
+	for (const auto &name : final_subsystems) {
+		DUCKDB_LOG_DEBUG(instance, "[BlobCache] - %s", name.c_str());
+	}
+}
+
 } // namespace duckdb
