@@ -10,6 +10,12 @@ install httpfs
 statement ok
 load httpfs
 
+statement ok
+CALL blobcache_config('.blobcache-filedebug', 256);
+
+statement ok
+select count(*) from read_csv('debug:///Users/peter/duckdb-blobcache/weather.csv');
+
 # Test that blobcache extension is properly loaded and table functions work  
 # Enable aggressive mode to cache CSV files (conservative mode by default only caches parquet)
 statement ok

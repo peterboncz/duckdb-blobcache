@@ -1,8 +1,12 @@
 #include "blobfs_wrapper.hpp"
 #include "blobcache.hpp"
+#include "debug_filesystem.hpp"
 #include "duckdb/common/virtual_file_system.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/logging/logger.hpp"
+#include "duckdb/common/string_util.hpp"
+#include <thread>
+#include <chrono>
 
 namespace duckdb {
 
@@ -13,51 +17,117 @@ namespace duckdb {
 unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileOpenFlags flags,
                                                         optional_ptr<FileOpener> opener) {
 	auto wrapped_handle = wrapped_fs->OpenFile(path, flags, opener);
-	
+
 	if (cache->IsCacheInitialized() && flags.OpenForReading() && !flags.OpenForWriting()) {
 		if (cache->ShouldCacheFile(path, opener)) {
-			string cache_key = path + ":" + wrapped_fs->GetName();
+			string cache_key = cache->GenerateCacheKey(path + ":" + wrapped_fs->GetName());
 			return make_uniq<BlobFileHandle>(*this, std::move(wrapped_handle), cache_key, cache);
 		}
 	}
-	
+
 	return wrapped_handle;
 }
 
 void BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
-	
+
+	// Update our file position when reading at explicit location
+	blob_handle.file_position = location + nr_bytes;
+
 	if (blob_handle.cache && blob_handle.cache->IsCacheInitialized()) {
+		// Try to get data from cache first
 		idx_t cache_bytes = static_cast<idx_t>(nr_bytes);
 		idx_t actual_cache_bytes = blob_handle.cache->ReadFromCache(blob_handle.cache_key, location, buffer, cache_bytes);
-		if (actual_cache_bytes > 0) return;
-		wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes, location);
-		blob_handle.cache->InsertCache(blob_handle.cache_key, location, buffer, nr_bytes);
+
+		if (actual_cache_bytes == static_cast<idx_t>(nr_bytes)) {
+			// Full cache hit - use cached data
+			return;
+		}
+
+		if (actual_cache_bytes > 0) {
+			// Partial cache hit - use what we got, read the rest from filesystem
+			idx_t remaining_location = location + actual_cache_bytes;
+			idx_t remaining_bytes = nr_bytes - actual_cache_bytes;
+			char *remaining_buffer = static_cast<char*>(buffer) + actual_cache_bytes;
+
+			if (remaining_bytes > 0) {
+				wrapped_fs->Read(*blob_handle.wrapped_handle, remaining_buffer, remaining_bytes, remaining_location);
+
+				// Cache the remaining data we just read
+				blob_handle.cache->InsertCacheWithKey(blob_handle.cache_key,
+				                                      blob_handle.wrapped_handle->GetPath(),
+				                                      remaining_location,
+				                                      remaining_buffer,
+				                                      remaining_bytes);
+			}
+		} else {
+			// Complete cache miss - read everything from filesystem
+			wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes, location);
+
+			// Cache what we just read
+			blob_handle.cache->InsertCacheWithKey(blob_handle.cache_key,
+			                                      blob_handle.wrapped_handle->GetPath(),
+			                                      location,
+			                                      buffer,
+			                                      nr_bytes);
+
+			// Add delay for debug filesystem
+			if (ShouldAddDebugDelay()) {
+				std::this_thread::sleep_for(std::chrono::seconds(1));
+			}
+		}
+
 		return;
 	}
-	
-	// No cache - single filesystem read call
+
+	// No cache - direct filesystem read
 	wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes, location);
+	if (ShouldAddDebugDelay()) {
+		std::this_thread::sleep_for(std::chrono::seconds(1));
+	}
 }
 
 int64_t BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
-	idx_t current_position = wrapped_fs->SeekPosition(*blob_handle.wrapped_handle);
-	
+
 	if (blob_handle.cache && blob_handle.cache->IsCacheInitialized()) {
 		idx_t cache_bytes = static_cast<idx_t>(nr_bytes);
-		idx_t actual_cache_bytes = blob_handle.cache->ReadFromCache(blob_handle.cache_key, current_position, buffer, cache_bytes);
-		if (actual_cache_bytes > 0) return static_cast<int64_t>(actual_cache_bytes);
-		wrapped_fs->Seek(*blob_handle.wrapped_handle, current_position);
+		idx_t actual_cache_bytes = blob_handle.cache->ReadFromCache(blob_handle.cache_key, blob_handle.file_position, buffer, cache_bytes);
+
+		if (actual_cache_bytes == static_cast<idx_t>(nr_bytes)) {
+			// Full cache hit - update position and return
+			blob_handle.file_position += actual_cache_bytes;
+			wrapped_fs->Seek(*blob_handle.wrapped_handle, blob_handle.file_position);
+			return static_cast<int64_t>(actual_cache_bytes);
+		}
+
+		// Cache miss or partial hit - read from filesystem
+		wrapped_fs->Seek(*blob_handle.wrapped_handle, blob_handle.file_position);
 		int64_t actual_read = wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes);
 		if (actual_read > 0) {
-			blob_handle.cache->InsertCache(blob_handle.cache_key, current_position, buffer, actual_read);
+			string original_filename = blob_handle.wrapped_handle->GetPath();
+			blob_handle.cache->InsertCacheWithKey(blob_handle.cache_key, original_filename, blob_handle.file_position, buffer, actual_read);
+
+			// Update our file position after filesystem read
+			blob_handle.file_position += actual_read;
+
+			// Add delay only when we actually read data from filesystem
+			if (ShouldAddDebugDelay()) {
+				std::this_thread::sleep_for(std::chrono::seconds(1));
+			}
 		}
 		return actual_read;
 	}
-	
+
 	// No cache - single filesystem read call
-	return wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes);
+	int64_t actual_read = wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes);
+	if (actual_read > 0) {
+		blob_handle.file_position += actual_read;
+		if (ShouldAddDebugDelay()) {
+			std::this_thread::sleep_for(std::chrono::seconds(1));
+		}
+	}
+	return actual_read;
 }
 
 void BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
@@ -66,6 +136,8 @@ void BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t nr_b
 		blob_handle.cache->InvalidateCache(blob_handle.cache_key);
 	}
 	wrapped_fs->Write(*blob_handle.wrapped_handle, buffer, nr_bytes, location);
+	// Update position after write at explicit location
+	blob_handle.file_position = location + nr_bytes;
 }
 
 int64_t BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t nr_bytes) {
@@ -73,7 +145,11 @@ int64_t BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t n
 	if (blob_handle.cache) {
 		blob_handle.cache->InvalidateCache(blob_handle.cache_key);
 	}
-	return wrapped_fs->Write(*blob_handle.wrapped_handle, buffer, nr_bytes);
+	int64_t bytes_written = wrapped_fs->Write(*blob_handle.wrapped_handle, buffer, nr_bytes);
+	if (bytes_written > 0) {
+		blob_handle.file_position += bytes_written;
+	}
+	return bytes_written;
 }
 
 void BlobFilesystemWrapper::Truncate(FileHandle &handle, int64_t new_size) {
@@ -86,17 +162,26 @@ void BlobFilesystemWrapper::Truncate(FileHandle &handle, int64_t new_size) {
 
 void BlobFilesystemWrapper::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
 	if (cache) {
-		cache->InvalidateCache(source + ":" + wrapped_fs->GetName());
-		cache->InvalidateCache(target + ":" + wrapped_fs->GetName());
+		cache->InvalidateCache(cache->GenerateCacheKey(source + ":" + wrapped_fs->GetName()));
+		cache->InvalidateCache(cache->GenerateCacheKey(target + ":" + wrapped_fs->GetName()));
 	}
 	wrapped_fs->MoveFile(source, target, opener);
 }
 
 void BlobFilesystemWrapper::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
 	if (cache) {
-		cache->InvalidateCache(filename + ":" + wrapped_fs->GetName());
+		cache->InvalidateCache(cache->GenerateCacheKey(filename + ":" + wrapped_fs->GetName()));
 	}
 	wrapped_fs->RemoveFile(filename, opener);
+}
+
+bool BlobFilesystemWrapper::ShouldAddDebugDelay() {
+	// Check if this is the debug filesystem and cache directory ends with '-filedebug'
+	if (wrapped_fs->GetName() == "debug") {
+		string cache_path = cache->GetCachePath();
+		return StringUtil::EndsWith(cache_path, "-filedebug");
+	}
+	return false;
 }
 
 //===----------------------------------------------------------------------===//
@@ -149,6 +234,7 @@ void WrapExistingFilesystems(DatabaseInstance &instance) {
 	auto subsystems = vfs->ListSubSystems();
 	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Found %zu registered subsystems", subsystems.size());
 
+
 	for (const auto &name : subsystems) {
 		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Processing subsystem: '%s'", name.c_str());
 
@@ -170,6 +256,12 @@ void WrapExistingFilesystems(DatabaseInstance &instance) {
 			DUCKDB_LOG_ERROR(instance, "[BlobCache] Failed to extract '%s' - subsystem not wrapped", name.c_str());
 		}
 	}
+
+	// Register debug:// filesystem for testing purposes - wrapped with caching
+	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Registering debug:// filesystem for testing");
+	auto debug_fs = make_uniq<DebugFileSystem>();
+	auto wrapped_debug_fs = make_uniq<BlobFilesystemWrapper>(std::move(debug_fs), shared_cache);
+	vfs->RegisterSubSystem(std::move(wrapped_debug_fs));
 
 	// Log final subsystem list
 	auto final_subsystems = vfs->ListSubSystems();

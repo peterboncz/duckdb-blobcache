@@ -6,6 +6,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/virtual_file_system.hpp"
 #include "duckdb/common/opener_file_system.hpp"
+#include "duckdb/storage/object_cache.hpp"
 #include "blobcache.hpp"
 
 namespace duckdb {
@@ -43,10 +44,10 @@ public:
 	BlobFileHandle(FileSystem &fs, unique_ptr<FileHandle> wrapped_handle, string cache_key,
 	               shared_ptr<BlobCache> cache)
 	    : FileHandle(fs, wrapped_handle->GetPath(), wrapped_handle->GetFlags()),
-	      wrapped_handle(std::move(wrapped_handle)), cache_key(std::move(cache_key)), 
-	      cache(cache) {
+	      wrapped_handle(std::move(wrapped_handle)), cache_key(std::move(cache_key)),
+	      cache(cache), file_position(0) {
 	}
-	
+
 	~BlobFileHandle() override = default;
 
 	void Close() override {
@@ -59,6 +60,7 @@ public:
 	unique_ptr<FileHandle> wrapped_handle;
 	string cache_key;
 	shared_ptr<BlobCache> cache;
+	idx_t file_position;  // Track our own file position
 };
 
 //===----------------------------------------------------------------------===//
@@ -70,13 +72,6 @@ public:
 	    : wrapped_fs(std::move(wrapped_fs)), cache(shared_cache) {
 	}
 	virtual ~BlobFilesystemWrapper() = default;
-
-	void InitializeCache(const string &cache_dir, idx_t max_size) {
-		cache->InitializeCache(cache_dir, max_size);
-	}
-	bool IsCacheInitialized() const {
-		return cache->IsCacheInitialized();
-	}
 
 	// FileSystem interface implementation
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
@@ -111,22 +106,21 @@ public:
 	}
 	void Seek(FileHandle &handle, idx_t location) override {
 		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		blob_handle.file_position = location;
 		if (blob_handle.wrapped_handle) {
 			wrapped_fs->Seek(*blob_handle.wrapped_handle, location);
 		}
 	}
 	void Reset(FileHandle &handle) override {
 		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		blob_handle.file_position = 0;
 		if (blob_handle.wrapped_handle) {
 			wrapped_fs->Reset(*blob_handle.wrapped_handle);
 		}
 	}
 	idx_t SeekPosition(FileHandle &handle) override {
 		auto &blob_handle = handle.Cast<BlobFileHandle>();
-		if (blob_handle.wrapped_handle) {
-			return wrapped_fs->SeekPosition(*blob_handle.wrapped_handle);
-		}
-		return 0;
+		return blob_handle.file_position;
 	}
 	bool CanSeek() override {
 		return wrapped_fs->CanSeek();
@@ -193,6 +187,9 @@ public:
 private:
 	unique_ptr<FileSystem> wrapped_fs;
 	shared_ptr<BlobCache> cache;
+
+	// Helper method to check if we should add debug delay
+	bool ShouldAddDebugDelay();
 };
 
 // Cache management functions

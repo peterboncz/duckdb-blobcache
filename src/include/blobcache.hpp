@@ -32,157 +32,6 @@
 
 namespace duckdb {
 
-//===----------------------------------------------------------------------====//
-// LRU Cache for managing file eviction
-//===----------------------------------------------------------------------===//
-class LRUCache {
-private:
-	struct LRUNode {
-		string key;
-		string filename;
-		LRUNode* prev;
-		unique_ptr<LRUNode> next;
-		
-		LRUNode(const string &k, const string &f) : key(k), filename(f), prev(nullptr), next(nullptr) {}
-	};
-	
-	unordered_map<string, LRUNode*> cache_map;
-	unique_ptr<LRUNode> head;
-	LRUNode* tail;
-	
-	void AddToFront(unique_ptr<LRUNode> node) {
-		if (!head) {
-			head = std::move(node);
-			tail = head.get();
-		} else {
-			node->next = std::move(head);
-			if (node->next) {
-				node->next->prev = node.get();
-			}
-			head = std::move(node);
-		}
-	}
-	
-	void MoveToFront(LRUNode* node) {
-		if (node == head.get()) {
-			return; // Already at front
-		}
-		
-		// Remove from current position
-		if (node->prev) {
-			node->prev->next = std::move(node->next);
-		}
-		if (node->next) {
-			node->next->prev = node->prev;
-		}
-		if (node == tail) {
-			tail = node->prev;
-		}
-		
-		// Move to front
-		unique_ptr<LRUNode> node_ptr;
-		if (node->prev) {
-			node_ptr = std::move(node->prev->next);
-		} else {
-			// This should never happen since we checked node != head
-			throw InternalException("Invalid LRU state");
-		}
-		
-		node_ptr->prev = nullptr;
-		node_ptr->next = std::move(head);
-		if (head) {
-			head->prev = node_ptr.get();
-		}
-		head = std::move(node_ptr);
-	}
-
-public:
-	LRUCache() : head(nullptr), tail(nullptr) {}
-	
-	~LRUCache() {
-		Clear();
-	}
-	
-	void Touch(const string &key, const string &filename) {
-		auto it = cache_map.find(key);
-		if (it != cache_map.end()) {
-			// Move existing node to front
-			MoveToFront(it->second);
-		} else {
-			// Add new node to front
-			auto node = make_uniq<LRUNode>(key, filename);
-			cache_map[key] = node.get();
-			AddToFront(std::move(node));
-		}
-	}
-	
-	bool Contains(const string &key) const {
-		return cache_map.find(key) != cache_map.end();
-	}
-	
-	string GetLRU() const {
-		if (!tail) {
-			return "";
-		}
-		return tail->key;
-	}
-	
-	string GetLRUFilename() const {
-		if (!tail) {
-			return "";
-		}
-		return tail->filename;
-	}
-	
-	void Remove(const string &key) {
-		auto it = cache_map.find(key);
-		if (it == cache_map.end()) {
-			return;
-		}
-		
-		LRUNode* node = it->second;
-		
-		// Remove from linked list
-		if (node->prev) {
-			node->prev->next = std::move(node->next);
-		} else {
-			head = std::move(node->next);
-		}
-		
-		if (node->next) {
-			node->next->prev = node->prev;
-		} else {
-			tail = node->prev;
-		}
-		
-		// Remove from map
-		cache_map.erase(it);
-		
-		// Node will be automatically deleted when unique_ptr goes out of scope
-	}
-	
-	bool Empty() const {
-		return cache_map.empty();
-	}
-	
-	void Clear() {
-		cache_map.clear();
-		head = nullptr;
-		tail = nullptr;
-	}
-	
-	// Get all keys in LRU order (least recently used first, i.e., from tail to head)
-	vector<string> GetKeysInLRUOrder() const {
-		vector<string> keys;
-		LRUNode* current = tail;
-		while (current) {
-			keys.push_back(current->key);
-			current = current->prev;
-		}
-		return keys;
-	}
-};
-
 //===----------------------------------------------------------------------===//
 // Cache data structures
 //===----------------------------------------------------------------------===//
@@ -218,6 +67,10 @@ struct CacheEntry {
 	map<idx_t, duckdb::shared_ptr<CacheRange>> ranges;  // Map of start position to shared CacheRange
 	mutable std::mutex ranges_mutex;  // Protects the ranges map and individual range statistics
 	idx_t cached_file_size = 0;  // Total bytes cached for this file
+
+	// LRU linked list pointers
+	CacheEntry* lru_prev = nullptr;
+	CacheEntry* lru_next = nullptr;
 };
 
 //===----------------------------------------------------------------------===//
@@ -235,9 +88,10 @@ private:
 	bool cache_initialized;
 	
 	// Cache state
-	unordered_map<string, CacheEntry> key_cache; // Maps cache key to CacheEntry
-	LRUCache lru_cache;
-	mutable std::mutex cache_mutex; // Protects key_cache, lru_cache, current_cache_size
+	unordered_map<string, unique_ptr<CacheEntry>> key_cache; // Maps cache key to CacheEntry
+	CacheEntry* lru_head = nullptr; // Most recently used
+	CacheEntry* lru_tail = nullptr; // Least recently used
+	mutable std::mutex cache_mutex; // Protects key_cache, LRU list, current_cache_size
 	
 	// Cached regex patterns for file filtering (updated via callback)
 	mutable std::mutex regex_mutex; // Protects cached regex state
@@ -258,7 +112,7 @@ private:
 	idx_t num_writer_threads;
 	
 	void CacheWriterThreadLoop(idx_t thread_id);
-	void QueueCacheWrite(const string &filename, duckdb::shared_ptr<CacheRange> range);
+	void QueueCacheWrite(const string &cache_key, duckdb::shared_ptr<CacheRange> range);
 	idx_t GetPartitionForKey(const string &cache_key) const;
 	
 	// Cache management helper methods
@@ -267,29 +121,25 @@ private:
 	void EvictKey(const string &cache_key);
 	idx_t CalculateFileBytes(const string &cache_key);
 	bool HasUnfinishedWrites(const string &cache_key);
-	
-	// Cache key generation methods
-	string GenerateCacheKey(const string &filename);
-	string ExtractValidSuffix(const string &filename, size_t max_chars);
+
+	// LRU list management and cache key generation methods - implemented inline at end of class
 	
 	// Disk cache helper methods
 	void InitializeCacheDirectory();
 	void CleanCacheDirectory();
 	void EnsureSubdirectoryExists(const string &cache_key);
 	int OpenCacheFile(const string &cache_key, int flags);
-	bool CreateCacheSubdirectory(const string &cache_key);
 	string GetCacheFilePath(const string &cache_key);
 	bool WriteToCacheFile(const string &cache_key, const void *data, idx_t size, idx_t &file_offset);
 	bool ReadFromCacheFile(const string &cache_key, idx_t file_offset, void *buffer, idx_t length);
 	void DeleteCacheFile(const string &cache_key);
-	string CalculateFileHash(const string &filename);
-	
+
 	friend class BlobFilesystemWrapper;
 
 public:
 	// Constructor/Destructor
 	explicit BlobCache(DatabaseInstance *db_instance = nullptr)
-	    : db_instance(db_instance), path_separator("/"), cache_capacity(DEFAULT_CACHE_CAPACITY), 
+	    : db_instance(db_instance), path_separator("/"), cache_capacity(DEFAULT_CACHE_CAPACITY),
 	      current_cache_size(0), cache_initialized(false), conservative_mode(true),
 	      shutdown_writer_threads(false), database_shutting_down(false), num_writer_threads(1) {
 		// Don't start the cache writer threads in constructor to avoid potential deadlocks
@@ -329,13 +179,15 @@ public:
 	
 	// Core cache operations
 	void InsertCache(const string &filename, idx_t start_pos, const void *buffer, int64_t length);
+	void InsertCacheWithKey(const string &cache_key, const string &filename, idx_t start_pos, const void *buffer, int64_t length);
 	// Combined cache lookup and read - returns bytes read from cache, adjusts nr_bytes if needed
 	idx_t ReadFromCache(const string &cache_key, idx_t position, void *buffer, idx_t &nr_bytes);
 	
 	// Cache management
 	void ClearCache() {
 		key_cache.clear();
-		lru_cache.Clear();
+		lru_head = nullptr;
+		lru_tail = nullptr;
 		current_cache_size = 0;
 		subdirs_created.reset();
 	}
@@ -376,6 +228,67 @@ public:
 	// Regex pattern management
 	void UpdateRegexPatterns(const string &regex_patterns_str);
 	void PurgeCacheForPatternChange(optional_ptr<FileOpener> opener = nullptr);
+
+	// Cache key generation
+	string GenerateCacheKey(const string &filename);
+
+	//===----------------------------------------------------------------------===//
+	// Inline implementations for trivial methods
+	//===----------------------------------------------------------------------===//
+
+	// LRU list management methods
+	void TouchLRU(CacheEntry* entry) {
+		// Move entry to front of LRU list (most recently used)
+		// Note: Must be called with cache_mutex held
+		if (entry == lru_head) {
+			return; // Already at front
+		}
+
+		// Remove from current position
+		RemoveFromLRU(entry);
+
+		// Add to front
+		AddToLRUFront(entry);
+	}
+
+	void RemoveFromLRU(CacheEntry* entry) {
+		// Remove entry from LRU list
+		// Note: Must be called with cache_mutex held
+		if (entry->lru_prev) {
+			entry->lru_prev->lru_next = entry->lru_next;
+		} else {
+			lru_head = entry->lru_next;
+		}
+
+		if (entry->lru_next) {
+			entry->lru_next->lru_prev = entry->lru_prev;
+		} else {
+			lru_tail = entry->lru_prev;
+		}
+
+		entry->lru_prev = nullptr;
+		entry->lru_next = nullptr;
+	}
+
+	void AddToLRUFront(CacheEntry* entry) {
+		// Add entry to front of LRU list (most recently used)
+		// Note: Must be called with cache_mutex held
+		entry->lru_prev = nullptr;
+		entry->lru_next = lru_head;
+
+		if (lru_head) {
+			lru_head->lru_prev = entry;
+		}
+		lru_head = entry;
+
+		if (!lru_tail) {
+			lru_tail = entry;
+		}
+	}
+
+private:
+	// Helper method for cache key generation
+	string ExtractValidSuffix(const string &filename, size_t max_chars);
 };
 
 } // namespace duckdb
