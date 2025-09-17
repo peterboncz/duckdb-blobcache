@@ -140,21 +140,23 @@ static unique_ptr<GlobalTableFunctionState> BlobCacheStatsInitGlobal(ClientConte
 // Bind function for blobcache_stats
 static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, TableFunctionBindInput &input,
                                                     vector<LogicalType> &return_types, vector<string> &names) {
-	// Setup return schema - returns cache statistics with 6 columns
+	// Setup return schema - returns cache statistics with 7 columns
 	return_types.push_back(LogicalType::VARCHAR);   // protocol
 	return_types.push_back(LogicalType::VARCHAR);   // filename
+	return_types.push_back(LogicalType::BIGINT);    // file_offset
 	return_types.push_back(LogicalType::BIGINT);    // start
 	return_types.push_back(LogicalType::BIGINT);    // end
 	return_types.push_back(LogicalType::BIGINT);    // usage_count
 	return_types.push_back(LogicalType::BIGINT);    // bytes_from_cache
-	
+
 	names.push_back("protocol");
 	names.push_back("filename");
+	names.push_back("file_offset");
 	names.push_back("start");
 	names.push_back("end");
 	names.push_back("usage_count");
 	names.push_back("bytes_from_cache");
-	
+
 	return nullptr; // No bind data needed for stats function
 }
 
@@ -252,13 +254,14 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 	for (idx_t i = 0; i < chunk_size; i++) {
 		idx_t row_idx = start_idx + i;
 		const auto &info = global_state.range_infos[row_idx];
-		
+
 		output.data[0].SetValue(i, Value(info.protocol));
 		output.data[1].SetValue(i, Value(info.filename));
-		output.data[2].SetValue(i, Value::BIGINT(static_cast<int64_t>(info.start)));
-		output.data[3].SetValue(i, Value::BIGINT(static_cast<int64_t>(info.end)));
-		output.data[4].SetValue(i, Value::BIGINT(static_cast<int64_t>(info.usage_count)));
-		output.data[5].SetValue(i, Value::BIGINT(static_cast<int64_t>(info.bytes_from_cache)));
+		output.data[2].SetValue(i, Value::BIGINT(static_cast<int64_t>(info.file_offset)));
+		output.data[3].SetValue(i, Value::BIGINT(static_cast<int64_t>(info.start)));
+		output.data[4].SetValue(i, Value::BIGINT(static_cast<int64_t>(info.end)));
+		output.data[5].SetValue(i, Value::BIGINT(static_cast<int64_t>(info.usage_count)));
+		output.data[6].SetValue(i, Value::BIGINT(static_cast<int64_t>(info.bytes_from_cache)));
 	}
 	
 	// Update the processed count

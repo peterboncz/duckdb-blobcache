@@ -178,10 +178,12 @@ public:
 
 	
 	// Core cache operations
-	void InsertCache(const string &filename, idx_t start_pos, const void *buffer, int64_t length);
-	void InsertCacheWithKey(const string &cache_key, const string &filename, idx_t start_pos, const void *buffer, int64_t length);
+	void InsertCache(const string &cache_key, const string &filename, idx_t start_pos, const void *buffer, int64_t length);
 	// Combined cache lookup and read - returns bytes read from cache, adjusts nr_bytes if needed
 	idx_t ReadFromCache(const string &cache_key, idx_t position, void *buffer, idx_t &nr_bytes);
+
+	// Range merging
+	void TryMergeWithPrevious(const string &cache_key, duckdb::shared_ptr<CacheRange> range);
 	
 	// Cache management
 	void ClearCache() {
@@ -214,6 +216,7 @@ public:
 	struct RangeInfo {
 		string protocol;
 		string filename;
+		idx_t file_offset;
 		idx_t start, end;
 		idx_t usage_count;
 		idx_t bytes_from_cache;

@@ -28,106 +28,94 @@ unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileO
 	return wrapped_handle;
 }
 
+#define HTTP_EFFICIENT_UNIT (1<<21)
+
+static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_handle, char* buffer, idx_t location_orig, idx_t nr_bytes, bool add_debug_delay) {
+	// NOTE: ReadFromCache() can return cached_bytes == 0 but adjust nr_bytes downwards to align with a cached range
+	idx_t location = location_orig;
+	idx_t nr_cached = blob_handle.cache->ReadFromCache(blob_handle.cache_key, location, buffer, nr_bytes);
+	idx_t nr_read = nr_bytes - nr_cached;
+	if (nr_read > 0) { // Read the non-cached range and cache it
+		char* tmp_buffer = buffer + nr_cached;
+		bool overfetch = false;
+		idx_t actual_read_size = nr_read;
+
+		// Debug logging
+		blob_handle.cache->LogDebug(StringUtil::Format(
+		    "[ReadChunk] location_orig=%llu, location=%llu, nr_bytes=%llu, nr_cached=%llu, nr_read=%llu",
+		    location_orig, location, nr_bytes, nr_cached, nr_read));
+
+		if (nr_read < HTTP_EFFICIENT_UNIT) { // overfetch to get bigger and faster requests
+			tmp_buffer = new char[HTTP_EFFICIENT_UNIT];
+			actual_read_size = HTTP_EFFICIENT_UNIT;
+			overfetch = true;
+			if (nr_cached == 0 && (location & ~(HTTP_EFFICIENT_UNIT-1)) + HTTP_EFFICIENT_UNIT > location+nr_bytes) {
+				location &= ~(HTTP_EFFICIENT_UNIT-1);
+			}
+			blob_handle.cache->LogDebug(StringUtil::Format(
+			    "[ReadChunk] Overfetching: new location=%llu, actual_read_size=%llu",
+			    location, actual_read_size));
+		}
+
+		wrapped_fs.Seek(*blob_handle.wrapped_handle, location);
+		// BUG FIX: Should read into tmp_buffer, not buffer!
+		idx_t bytes_actually_read = wrapped_fs.Read(*blob_handle.wrapped_handle, tmp_buffer, actual_read_size);
+		blob_handle.file_position = location + bytes_actually_read; // move file position
+
+		blob_handle.cache->LogDebug(StringUtil::Format(
+		    "[ReadChunk] Read %llu bytes from file at location %llu",
+		    bytes_actually_read, location));
+
+		// Insert into cache
+		blob_handle.cache->InsertCache(blob_handle.cache_key, blob_handle.wrapped_handle->GetPath(), location, tmp_buffer, bytes_actually_read);
+
+		if (overfetch) { // we overfetched to fill the cache
+			// Copy only the requested portion to the output buffer
+			idx_t offset = location_orig - location;
+			idx_t copy_size = std::min(nr_read, bytes_actually_read - offset);
+
+			blob_handle.cache->LogDebug(StringUtil::Format(
+			    "[ReadChunk] Overfetch copy: offset=%llu, copy_size=%llu, buffer_offset=%llu",
+			    offset, copy_size, nr_cached));
+
+			memcpy(buffer + nr_cached, tmp_buffer + offset, copy_size);
+			delete[] tmp_buffer;
+			nr_read = copy_size;
+		} else {
+			// When not overfetching, tmp_buffer points to buffer+nr_cached, so data is already in place
+			nr_read = bytes_actually_read;
+		}
+
+		if (add_debug_delay) { // Add delay for debug filesystem
+			std::this_thread::sleep_for(std::chrono::seconds(1));
+		}
+	}
+	return nr_cached + nr_read;
+}
+
 void BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
-
-	// Update our file position when reading at explicit location
-	blob_handle.file_position = location + nr_bytes;
-
-	if (blob_handle.cache && blob_handle.cache->IsCacheInitialized()) {
-		// Try to get data from cache first
-		idx_t cache_bytes = static_cast<idx_t>(nr_bytes);
-		idx_t actual_cache_bytes = blob_handle.cache->ReadFromCache(blob_handle.cache_key, location, buffer, cache_bytes);
-
-		if (actual_cache_bytes == static_cast<idx_t>(nr_bytes)) {
-			// Full cache hit - use cached data
-			return;
-		}
-
-		if (actual_cache_bytes > 0) {
-			// Partial cache hit - use what we got, read the rest from filesystem
-			idx_t remaining_location = location + actual_cache_bytes;
-			idx_t remaining_bytes = nr_bytes - actual_cache_bytes;
-			char *remaining_buffer = static_cast<char*>(buffer) + actual_cache_bytes;
-
-			if (remaining_bytes > 0) {
-				wrapped_fs->Read(*blob_handle.wrapped_handle, remaining_buffer, remaining_bytes, remaining_location);
-
-				// Cache the remaining data we just read
-				blob_handle.cache->InsertCacheWithKey(blob_handle.cache_key,
-				                                      blob_handle.wrapped_handle->GetPath(),
-				                                      remaining_location,
-				                                      remaining_buffer,
-				                                      remaining_bytes);
-			}
-		} else {
-			// Complete cache miss - read everything from filesystem
-			wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes, location);
-
-			// Cache what we just read
-			blob_handle.cache->InsertCacheWithKey(blob_handle.cache_key,
-			                                      blob_handle.wrapped_handle->GetPath(),
-			                                      location,
-			                                      buffer,
-			                                      nr_bytes);
-
-			// Add delay for debug filesystem
-			if (ShouldAddDebugDelay()) {
-				std::this_thread::sleep_for(std::chrono::seconds(1));
-			}
-		}
-
-		return;
+	if (!blob_handle.cache || !cache->IsCacheInitialized()) {
+		wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes, location);
+		return; // a read that cannot cache
 	}
-
-	// No cache - direct filesystem read
-	wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes, location);
-	if (ShouldAddDebugDelay()) {
-		std::this_thread::sleep_for(std::chrono::seconds(1));
-	}
+	// the ReadFromCache() can break down one large range into multiple around caching boundaries
+	char *buffer_ptr = static_cast<char*>(buffer);
+	idx_t chunk_bytes;
+	do { // keep iterating over ranges
+		chunk_bytes = ReadChunk(*wrapped_fs, blob_handle, buffer_ptr, location, nr_bytes, ShouldAddDebugDelay());
+		nr_bytes -= chunk_bytes;
+		location += chunk_bytes;
+		buffer_ptr += chunk_bytes;
+	} while (nr_bytes > 0 && chunk_bytes > 0); //  not done reading and not EOF
 }
 
 int64_t BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
-
-	if (blob_handle.cache && blob_handle.cache->IsCacheInitialized()) {
-		idx_t cache_bytes = static_cast<idx_t>(nr_bytes);
-		idx_t actual_cache_bytes = blob_handle.cache->ReadFromCache(blob_handle.cache_key, blob_handle.file_position, buffer, cache_bytes);
-
-		if (actual_cache_bytes == static_cast<idx_t>(nr_bytes)) {
-			// Full cache hit - update position and return
-			blob_handle.file_position += actual_cache_bytes;
-			wrapped_fs->Seek(*blob_handle.wrapped_handle, blob_handle.file_position);
-			return static_cast<int64_t>(actual_cache_bytes);
-		}
-
-		// Cache miss or partial hit - read from filesystem
-		wrapped_fs->Seek(*blob_handle.wrapped_handle, blob_handle.file_position);
-		int64_t actual_read = wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes);
-		if (actual_read > 0) {
-			string original_filename = blob_handle.wrapped_handle->GetPath();
-			blob_handle.cache->InsertCacheWithKey(blob_handle.cache_key, original_filename, blob_handle.file_position, buffer, actual_read);
-
-			// Update our file position after filesystem read
-			blob_handle.file_position += actual_read;
-
-			// Add delay only when we actually read data from filesystem
-			if (ShouldAddDebugDelay()) {
-				std::this_thread::sleep_for(std::chrono::seconds(1));
-			}
-		}
-		return actual_read;
+	if (!blob_handle.cache || !cache->IsCacheInitialized()) {
+		return wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes);
 	}
-
-	// No cache - single filesystem read call
-	int64_t actual_read = wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes);
-	if (actual_read > 0) {
-		blob_handle.file_position += actual_read;
-		if (ShouldAddDebugDelay()) {
-			std::this_thread::sleep_for(std::chrono::seconds(1));
-		}
-	}
-	return actual_read;
+	return ReadChunk(*wrapped_fs, blob_handle, static_cast<char*>(buffer), blob_handle.file_position, nr_bytes, ShouldAddDebugDelay());
 }
 
 void BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
