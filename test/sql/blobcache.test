@@ -4,6 +4,8 @@
 
 require blobcache
 
+require parquet
+
 statement ok
 install httpfs
 
@@ -11,7 +13,16 @@ statement ok
 load httpfs
 
 statement ok
+set threads = 1
+
+statement ok
 CALL blobcache_config('.blobcache-filedebug', 256);
+
+statement ok
+select ps_comment from read_parquet('debug:///Users/peter/duckdb-blobcache/partsupp.parquet');
+
+statement ok
+select ps_comment from read_parquet('debug:///Users/peter/duckdb-blobcache/partsupp.parquet');
 
 statement ok
 select count(*) from read_csv('debug:///Users/peter/duckdb-blobcache/weather.csv');

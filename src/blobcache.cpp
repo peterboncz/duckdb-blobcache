@@ -2,28 +2,27 @@
 
 namespace duckdb {
 
-static duckdb::shared_ptr<CacheRange> AnalyzeRange(CacheEntry *cache_entry, idx_t position, idx_t &nr_bytes) {
+static duckdb::shared_ptr<CacheRange> AnalyzeRange(CacheEntry *cache_entry, idx_t position, idx_t &max_nr_bytes) {
 	auto it = cache_entry->ranges.upper_bound(position);
+	shared_ptr<CacheRange> hit_range;
 
 	if (it != cache_entry->ranges.begin()) { // is there a range that starts <= start_pos?
-		auto hit_range = std::prev(it)->second;
-		if (hit_range->end > position) { // it covers the start of this range
-			if (hit_range->end < position + nr_bytes) {
-				nr_bytes = hit_range->end - position; // limit end to the cached end
-			}
-			return hit_range;
+		auto prev_range = std::prev(it)->second;
+		if (prev_range->end > position &&  // it covers the start of this range
+		    prev_range->memory_buffer) { // range is only ready if this is filled
+			hit_range = prev_range; // so it is a hit
 		}
 	}
-	if (it != cache_entry->ranges.end() && it->second->start < position + nr_bytes) {
-		nr_bytes = it->second->start - position; // cut short our range because the end is already cached now
+	if (it != cache_entry->ranges.end() && it->second->start < position + max_nr_bytes) {
+		max_nr_bytes = it->second->start - position; // cut short our range because the end is already cached now
 	}
-	return nullptr;
+	return hit_range;
 }
 
-idx_t BlobCache::ReadFromCache(const string &cache_key, idx_t position, void *buffer, idx_t &nr_bytes) {
+idx_t BlobCache::ReadFromCache(const string &cache_key, idx_t position, void *buffer, idx_t &max_nr_bytes) {
 	duckdb::shared_ptr<SharedBuffer> mem_buffer = nullptr; // if set, read from temp in-memory write-buffer
 	duckdb::shared_ptr<CacheRange> hit_range = nullptr;
-	idx_t offset = 0;
+	idx_t offset = 0, hit_size = 0;
 	{
 		std::lock_guard<std::mutex> lock(cache_mutex);
 
@@ -32,14 +31,12 @@ idx_t BlobCache::ReadFromCache(const string &cache_key, idx_t position, void *bu
 			return 0; // No cache entry
 		}
 		CacheEntry* cache_entry = cache_it->second.get();
-
-		// Lock ranges mutex to prevent range modification during search
-		std::lock_guard<std::mutex> ranges_lock(cache_entry->ranges_mutex);
-
-		hit_range = AnalyzeRange(cache_entry, position, nr_bytes); // adjusts lo and hi potentially
+		hit_range = AnalyzeRange(cache_entry, position, max_nr_bytes); // adjusts lo and hi potentially
 		if (hit_range) { // hit
+			hit_size = std::min(max_nr_bytes, hit_range->end - position);
 			TouchLRU(cache_entry);
-			hit_range->bytes_from_cache += nr_bytes;
+
+			hit_range->bytes_from_cache += hit_size;
 			hit_range->usage_count++;
 			offset = position - hit_range->start;
 			if (!hit_range->disk_write_complete) {
@@ -50,13 +47,12 @@ idx_t BlobCache::ReadFromCache(const string &cache_key, idx_t position, void *bu
 	// All locks released here
 	if (hit_range) {
 		if (mem_buffer) { // read from shared_ptr buffer (in progress write)
-			std::memcpy(buffer, mem_buffer->data.get() + offset, nr_bytes);
-		} else if (!ReadFromCacheFile(cache_key, offset + hit_range->file_offset, buffer, nr_bytes)) {
-			return 0; // read from cached file failed!
+			std::memcpy(buffer, mem_buffer->data.get() + offset, hit_size);
+		} else if (!ReadFromCacheFile(cache_key, hit_range->file_offset + offset, buffer, hit_size)) {
+			hit_size = 0; // read from cached file failed!
 		}
-		return nr_bytes;
 	}
-	return 0; // No cache hit, return 0 to indicate wrapped_fs should be used
+	return hit_size; // No cache hit, return 0 to indicate wrapped_fs should be used
 }
 
 void BlobCache::InvalidateCache(const string &filename) {
@@ -67,16 +63,13 @@ void BlobCache::InvalidateCache(const string &filename) {
 	EvictFile(filename);
 }
 
-void BlobCache::InsertCache(const string &cache_key, const string &filename, idx_t position, const void *buffer, int64_t nr_bytes) {
-	idx_t actual_bytes = 0, start_pos = position, end_pos = start_pos + nr_bytes;
-
-	if (nr_bytes < 0 || !cache_initialized || static_cast<idx_t>(nr_bytes) > cache_capacity) {
-		return;
-	}
-	// though eventually we might not write everything, this is rare. Make a full copy for background writes
-	auto tmp_buffer = duckdb::make_shared_ptr<SharedBuffer>(nr_bytes);
+void BlobCache::InsertCache(const string &cache_key, const string &filename, idx_t position, const void *buffer, idx_t max_nr_bytes) {
+	idx_t actual_bytes = 0, start_pos = position;
 	CacheEntry *cache_entry = nullptr;
 
+	if (!max_nr_bytes || !cache_initialized || static_cast<idx_t>(max_nr_bytes) > cache_capacity) {
+		return;
+	}
 	// Acquire both mutexes: global first, then entry-specific
 	std::unique_lock<std::mutex> lock(cache_mutex);
 
@@ -95,15 +88,14 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 		return; // name collision (rare)
 	}
 
-	// Lock the entry's mutex while holding global mutex to prevent eviction
-	std::lock_guard<std::mutex> ranges_lock(cache_entry->ranges_mutex);
-
 	// Check if range already cached
-	auto hit_range = AnalyzeRange(cache_entry, start_pos, end_pos); // adjusts lo and hi potentially
+	auto hit_range = AnalyzeRange(cache_entry, start_pos, max_nr_bytes);
+	auto end_pos = start_pos + max_nr_bytes;
+	idx_t offset = 0;
 	if (hit_range) { // another thread cached the same range in the meantime
+		offset = hit_range->end - start_pos;
 		start_pos = hit_range->end; // cache only from the end
 	}
-
 	if (end_pos > start_pos) {
 		actual_bytes = end_pos - start_pos;
 	}
@@ -112,19 +104,20 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 	}
 	current_cache_size += actual_bytes;
 
-	// Add the new range
-	auto new_range = duckdb::make_shared_ptr<CacheRange>(start_pos, end_pos, tmp_buffer);
+	auto new_range = duckdb::make_shared_ptr<CacheRange>(start_pos, end_pos);
 	cache_entry->ranges[start_pos] = new_range;
 	cache_entry->cached_file_size += actual_bytes;
-
-	// Queue for writing to disk
-	QueueCacheWrite(cache_key, new_range);
 
 	// Release global mutex - ranges_mutex still held for memcpy and job queue
 	lock.unlock();
 
-	// Copy data into tmp_buffer
-	std::memcpy(tmp_buffer->data.get(), static_cast<const char*>(buffer) + start_pos - position, actual_bytes);
+	// allocate and copy data into tmp_buffer outside lock (can be slowish)
+	auto mem_buffer = duckdb::make_shared_ptr<SharedBuffer>(actual_bytes);
+	std::memcpy(mem_buffer->data.get(), static_cast<const char*>(buffer) + offset, actual_bytes);
+	new_range->memory_buffer = mem_buffer; // lock-free assignment sequence: assign after copy
+
+	    // Queue for writing to disk
+	QueueCacheWrite(cache_key, new_range);
 }
 
 void BlobCache::TryMergeWithPrevious(const string &cache_key, duckdb::shared_ptr<CacheRange> range) {
@@ -135,8 +128,6 @@ void BlobCache::TryMergeWithPrevious(const string &cache_key, duckdb::shared_ptr
 		return; // Cache entry was evicted
 	}
 	CacheEntry* cache_entry = cache_it->second.get();
-
-	std::lock_guard<std::mutex> ranges_lock(cache_entry->ranges_mutex);
 
 	// Find the range that was just written (by start position)
 	auto current_it = cache_entry->ranges.find(range->start);
@@ -268,7 +259,7 @@ void BlobCache::CacheWriterThreadLoop(idx_t thread_id) {
 										   range->start, range->end, cache_key.c_str()));
 
 			// Check if we can merge with the previous range
-			TryMergeWithPrevious(cache_key, range);
+			//TryMergeWithPrevious(cache_key, range);
 		}
 	}
 	// Only log thread shutdown if not during database shutdown to avoid access to destroyed instance
@@ -290,7 +281,6 @@ void BlobCache::QueueCacheWrite(const string &cache_key, duckdb::shared_ptr<Cach
 bool BlobCache::HasUnfinishedWrites(const string &cache_key) {
 	auto cache_it = key_cache.find(cache_key);
 	if (cache_it == key_cache.end()) return false;
-	std::lock_guard<std::mutex> ranges_lock(cache_it->second->ranges_mutex);
 	for (const auto &range_pair : cache_it->second->ranges) {
 		if (range_pair.second->memory_buffer && !range_pair.second->disk_write_complete) {
 			return true;
@@ -363,12 +353,12 @@ void BlobCache::EvictKey(const string &cache_key) {
 	idx_t file_bytes = CalculateFileBytes(cache_key);
 	auto cache_it = key_cache.find(cache_key);
 	if (cache_it != key_cache.end()) {
-		// Try to lock the ranges mutex - if we can't, the entry is in use and shouldn't be evicted
-		std::unique_lock<std::mutex> ranges_lock(cache_it->second->ranges_mutex, std::try_to_lock);
-		if (!ranges_lock.owns_lock()) {
-			// Entry is currently in use, skip eviction
-			LogDebug(StringUtil::Format("Skipping eviction of key '%s' - entry is in use", cache_key.c_str()));
-			return;
+		for(auto &range : cache_it->second->ranges) {
+			if (!range.second->disk_write_complete)	{
+				// Entry is currently in use, skip eviction
+				LogDebug(StringUtil::Format("Skipping eviction of key '%s' - entry is in use", cache_key.c_str()));
+				return;
+			}
 		}
 		// Safe to evict - ranges_mutex is locked so no other thread is using this entry
 		RemoveFromLRU(cache_it->second.get());
@@ -384,7 +374,6 @@ idx_t BlobCache::CalculateFileBytes(const string &cache_key) {
 }
 
 // Cache key generation methods moved to inline implementations in blobcache.hpp
-
 idx_t BlobCache::GetPartitionForKey(const string &cache_key) const {
 	string hex_prefix = cache_key.substr(0, 2);
 	idx_t partition_hash = std::stoul(hex_prefix, nullptr, 16);
@@ -503,9 +492,6 @@ vector<BlobCache::RangeInfo> BlobCache::GetCacheStatistics(idx_t max_results) co
 		}
 
 		if (!cache_key.empty()) {
-			// Lock the ranges for this entry
-			std::lock_guard<std::mutex> ranges_lock(current->ranges_mutex);
-
 			for (const auto &range_pair : current->ranges) {
 				const auto &range = range_pair.second;
 				RangeInfo info;
@@ -656,12 +642,6 @@ int BlobCache::OpenCacheFile(const string &cache_key, int flags) {
 
 bool BlobCache::ReadFromCacheFile(const string &cache_key, idx_t file_offset, void *buffer, idx_t length) {
 	int flags = O_RDONLY;
-#ifdef O_BINARY
-	flags |= O_BINARY;
-#endif
-#ifdef O_DIRECT
-	flags |= O_DIRECT;  // Use unbuffered I/O for binary data integrity
-#endif
 	int fd = OpenCacheFile(cache_key, flags);
 	if (fd == -1) {
 		return false;
@@ -686,12 +666,6 @@ bool BlobCache::ReadFromCacheFile(const string &cache_key, idx_t file_offset, vo
 bool BlobCache::WriteToCacheFile(const string &cache_key, const void *buffer, idx_t length, idx_t &file_offset) {
 	// Open file for append to get current end position
 	int flags = O_WRONLY | O_CREAT | O_APPEND;
-#ifdef O_BINARY
-	flags |= O_BINARY;
-#endif
-#ifdef O_DIRECT
-	flags |= O_DIRECT;  // Use unbuffered I/O for binary data integrity
-#endif
 	int fd = OpenCacheFile(cache_key, flags);
 	if (fd == -1) {
 		return false;
@@ -872,8 +846,8 @@ string BlobCache::GenerateCacheKey(const string &filename) {
 	string filename_lower = StringUtil::Lower(filename);
 	size_t protocol_end = filename_lower.find("://");
 	string protocol_suffix = (protocol_end != string::npos && protocol_end > 0) ?
-		"-" + filename_lower.substr(0, protocol_end) : "";
-	return hex_hash + "-" + suffix + protocol_suffix;
+		":" + filename_lower.substr(0, protocol_end) : "";
+	return hex_hash + ":" + suffix + protocol_suffix;
 }
 
 string BlobCache::ExtractValidSuffix(const string &filename, size_t max_chars) {

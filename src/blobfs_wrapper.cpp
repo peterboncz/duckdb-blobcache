@@ -20,7 +20,7 @@ unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileO
 
 	if (cache->IsCacheInitialized() && flags.OpenForReading() && !flags.OpenForWriting()) {
 		if (cache->ShouldCacheFile(path, opener)) {
-			string cache_key = cache->GenerateCacheKey(path + ":" + wrapped_fs->GetName());
+			string cache_key = cache->GenerateCacheKey(path);
 			return make_uniq<BlobFileHandle>(*this, std::move(wrapped_handle), cache_key, cache);
 		}
 	}
@@ -28,70 +28,35 @@ unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileO
 	return wrapped_handle;
 }
 
-#define HTTP_EFFICIENT_UNIT (1<<21)
-
-static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_handle, char* buffer, idx_t location_orig, idx_t nr_bytes, bool add_debug_delay) {
-	// NOTE: ReadFromCache() can return cached_bytes == 0 but adjust nr_bytes downwards to align with a cached range
-	idx_t location = location_orig;
-	idx_t nr_cached = blob_handle.cache->ReadFromCache(blob_handle.cache_key, location, buffer, nr_bytes);
-	idx_t nr_read = nr_bytes - nr_cached;
-	if (nr_read > 0) { // Read the non-cached range and cache it
-		char* tmp_buffer = buffer + nr_cached;
-		bool overfetch = false;
-		idx_t actual_read_size = nr_read;
-
-		// Debug logging
-		blob_handle.cache->LogDebug(StringUtil::Format(
-		    "[ReadChunk] location_orig=%llu, location=%llu, nr_bytes=%llu, nr_cached=%llu, nr_read=%llu",
-		    location_orig, location, nr_bytes, nr_cached, nr_read));
-
-		if (nr_read < HTTP_EFFICIENT_UNIT) { // overfetch to get bigger and faster requests
-			tmp_buffer = new char[HTTP_EFFICIENT_UNIT];
-			actual_read_size = HTTP_EFFICIENT_UNIT;
-			overfetch = true;
-			if (nr_cached == 0 && (location & ~(HTTP_EFFICIENT_UNIT-1)) + HTTP_EFFICIENT_UNIT > location+nr_bytes) {
-				location &= ~(HTTP_EFFICIENT_UNIT-1);
-			}
-			blob_handle.cache->LogDebug(StringUtil::Format(
-			    "[ReadChunk] Overfetching: new location=%llu, actual_read_size=%llu",
-			    location, actual_read_size));
-		}
-
+static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_handle, char* buffer, idx_t location, idx_t max_nr_bytes) {
+	// NOTE: ReadFromCache() can return cached_bytes == 0 but adjust max_nr_bytes downwards to align with a cached range
+	idx_t nr_bytes = blob_handle.cache->ReadFromCache(blob_handle.cache_key, location, buffer, max_nr_bytes);
+#if 0
+    if (nr_bytes > 0) { // debug
+		char *tmp_buffer = new char[nr_bytes];
 		wrapped_fs.Seek(*blob_handle.wrapped_handle, location);
-		// BUG FIX: Should read into tmp_buffer, not buffer!
-		idx_t bytes_actually_read = wrapped_fs.Read(*blob_handle.wrapped_handle, tmp_buffer, actual_read_size);
-		blob_handle.file_position = location + bytes_actually_read; // move file position
-
-		blob_handle.cache->LogDebug(StringUtil::Format(
-		    "[ReadChunk] Read %llu bytes from file at location %llu",
-		    bytes_actually_read, location));
-
-		// Insert into cache
-		blob_handle.cache->InsertCache(blob_handle.cache_key, blob_handle.wrapped_handle->GetPath(), location, tmp_buffer, bytes_actually_read);
-
-		if (overfetch) { // we overfetched to fill the cache
-			// Copy only the requested portion to the output buffer
-			idx_t offset = location_orig - location;
-			idx_t copy_size = std::min(nr_read, bytes_actually_read - offset);
-
-			blob_handle.cache->LogDebug(StringUtil::Format(
-			    "[ReadChunk] Overfetch copy: offset=%llu, copy_size=%llu, buffer_offset=%llu",
-			    offset, copy_size, nr_cached));
-
-			memcpy(buffer + nr_cached, tmp_buffer + offset, copy_size);
-			delete[] tmp_buffer;
-			nr_read = copy_size;
-		} else {
-			// When not overfetching, tmp_buffer points to buffer+nr_cached, so data is already in place
-			nr_read = bytes_actually_read;
-		}
-
-		if (add_debug_delay) { // Add delay for debug filesystem
-			std::this_thread::sleep_for(std::chrono::seconds(1));
+		idx_t tst_bytes = wrapped_fs.Read(*blob_handle.wrapped_handle, tmp_buffer, nr_bytes);
+		if (tst_bytes != nr_bytes) {
+			throw "unable to read";
+		} else if (memcmp(tmp_buffer, buffer, nr_bytes)) {
+			throw "unequal contents";
 		}
 	}
-	return nr_cached + nr_read;
+#endif
+	buffer += nr_bytes;
+	location += nr_bytes;
+	if (max_nr_bytes > nr_bytes)  { // Read the non-cached range and cache it
+		idx_t nr_read = max_nr_bytes - nr_bytes;
+		wrapped_fs.Seek(*blob_handle.wrapped_handle, location);
+		nr_read = wrapped_fs.Read(*blob_handle.wrapped_handle, buffer, nr_read);
+		blob_handle.cache->InsertCache(blob_handle.cache_key, blob_handle.wrapped_handle->GetPath(), location, buffer, nr_read);
+		location += nr_read;
+		nr_bytes += nr_read;
+	}
+	blob_handle.file_position = location; // move file position
+	return nr_bytes;
 }
+
 
 void BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
@@ -103,7 +68,7 @@ void BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_by
 	char *buffer_ptr = static_cast<char*>(buffer);
 	idx_t chunk_bytes;
 	do { // keep iterating over ranges
-		chunk_bytes = ReadChunk(*wrapped_fs, blob_handle, buffer_ptr, location, nr_bytes, ShouldAddDebugDelay());
+		chunk_bytes = ReadChunk(*wrapped_fs, blob_handle, buffer_ptr, location, nr_bytes);
 		nr_bytes -= chunk_bytes;
 		location += chunk_bytes;
 		buffer_ptr += chunk_bytes;
@@ -115,7 +80,7 @@ int64_t BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr
 	if (!blob_handle.cache || !cache->IsCacheInitialized()) {
 		return wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes);
 	}
-	return ReadChunk(*wrapped_fs, blob_handle, static_cast<char*>(buffer), blob_handle.file_position, nr_bytes, ShouldAddDebugDelay());
+	return ReadChunk(*wrapped_fs, blob_handle, static_cast<char*>(buffer), blob_handle.file_position, nr_bytes);
 }
 
 void BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
@@ -150,26 +115,17 @@ void BlobFilesystemWrapper::Truncate(FileHandle &handle, int64_t new_size) {
 
 void BlobFilesystemWrapper::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
 	if (cache) {
-		cache->InvalidateCache(cache->GenerateCacheKey(source + ":" + wrapped_fs->GetName()));
-		cache->InvalidateCache(cache->GenerateCacheKey(target + ":" + wrapped_fs->GetName()));
+		cache->InvalidateCache(cache->GenerateCacheKey(source));
+		cache->InvalidateCache(cache->GenerateCacheKey(target));
 	}
 	wrapped_fs->MoveFile(source, target, opener);
 }
 
 void BlobFilesystemWrapper::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
 	if (cache) {
-		cache->InvalidateCache(cache->GenerateCacheKey(filename + ":" + wrapped_fs->GetName()));
+		cache->InvalidateCache(cache->GenerateCacheKey(filename));
 	}
 	wrapped_fs->RemoveFile(filename, opener);
-}
-
-bool BlobFilesystemWrapper::ShouldAddDebugDelay() {
-	// Check if this is the debug filesystem and cache directory ends with '-filedebug'
-	if (wrapped_fs->GetName() == "debug") {
-		string cache_path = cache->GetCachePath();
-		return StringUtil::EndsWith(cache_path, "-filedebug");
-	}
-	return false;
 }
 
 //===----------------------------------------------------------------------===//

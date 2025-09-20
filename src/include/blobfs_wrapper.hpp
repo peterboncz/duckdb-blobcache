@@ -187,9 +187,6 @@ public:
 private:
 	unique_ptr<FileSystem> wrapped_fs;
 	shared_ptr<BlobCache> cache;
-
-	// Helper method to check if we should add debug delay
-	bool ShouldAddDebugDelay();
 };
 
 // Cache management functions

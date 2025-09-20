@@ -49,23 +49,12 @@ struct CacheRange {
 	idx_t bytes_from_cache = 0;  // statistics - protected by ranges_mutex
 	duckdb::shared_ptr<SharedBuffer> memory_buffer;  // Temporary in-memory buffer until disk write completes
 	bool disk_write_complete = false;  // Whether the background disk write has completed
-
-	// Default constructor
-	CacheRange() = default;
-
-	// Constructor for disk-backed range
-	CacheRange(idx_t start, idx_t end, idx_t file_offset)
-		: start(start), end(end), file_offset(file_offset), disk_write_complete(true) {}
-
-	// Constructor for memory-backed range
-	CacheRange(idx_t start, idx_t end, duckdb::shared_ptr<SharedBuffer> buffer)
-		: start(start), end(end), file_offset(0), memory_buffer(std::move(buffer)), disk_write_complete(false) {}
+	CacheRange(idx_t start, idx_t end) : start(start), end(end) {}
 };
 
 struct CacheEntry {
 	string filename;
 	map<idx_t, duckdb::shared_ptr<CacheRange>> ranges;  // Map of start position to shared CacheRange
-	mutable std::mutex ranges_mutex;  // Protects the ranges map and individual range statistics
 	idx_t cached_file_size = 0;  // Total bytes cached for this file
 
 	// LRU linked list pointers
@@ -178,7 +167,7 @@ public:
 
 	
 	// Core cache operations
-	void InsertCache(const string &cache_key, const string &filename, idx_t start_pos, const void *buffer, int64_t length);
+	void InsertCache(const string &cache_key, const string &filename, idx_t start_pos, const void *buffer, idx_t length);
 	// Combined cache lookup and read - returns bytes read from cache, adjusts nr_bytes if needed
 	idx_t ReadFromCache(const string &cache_key, idx_t position, void *buffer, idx_t &nr_bytes);
 
