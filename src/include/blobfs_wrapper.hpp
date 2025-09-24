@@ -2,6 +2,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/local_file_system.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/virtual_file_system.hpp"
@@ -187,6 +188,48 @@ public:
 private:
 	unique_ptr<FileSystem> wrapped_fs;
 	shared_ptr<BlobCache> cache;
+};
+
+class DebugFileSystem : public LocalFileSystem {
+public:
+	DebugFileSystem() : LocalFileSystem() {}
+	~DebugFileSystem() override = default;
+
+	// Override to claim we can handle debug:// URLs
+	bool CanHandleFile(const string &fpath) override {
+		return StringUtil::StartsWith(StringUtil::Lower(fpath), "debug://");
+	}
+
+	// Override GetName to identify as debug filesystem
+	string GetName() const override {
+		return "debug";
+	}
+
+	// Override FileExists to handle debug:// URLs
+	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override {
+		string actual_path = StripDebugPrefix(filename);
+		return LocalFileSystem::FileExists(actual_path, opener);
+	}
+
+	// Override OpenFile to strip debug:// prefix
+	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
+	                                optional_ptr<FileOpener> opener = nullptr) override {
+		// Strip debug:// prefix to get actual local path
+		string actual_path = StripDebugPrefix(path);
+
+		// Call parent implementation with actual path
+		return LocalFileSystem::OpenFile(actual_path, flags, opener);
+	}
+
+private:
+	// Helper method to strip debug:// prefix
+	string StripDebugPrefix(const string &path) {
+		if (StringUtil::StartsWith(StringUtil::Lower(path), "debug://")) {
+			return path.substr(8);
+		}
+		return path;
+	}
+
 };
 
 // Cache management functions

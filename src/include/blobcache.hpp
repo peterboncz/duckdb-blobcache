@@ -42,18 +42,16 @@ struct SharedBuffer {
 };
 
 struct CacheRange {
-	idx_t start = 0;
-	idx_t end = 0;
-	idx_t file_offset = 0;  // Offset in the cache file where this range is stored
-	idx_t usage_count = 0;  // statistics - protected by ranges_mutex
-	idx_t bytes_from_cache = 0;  // statistics - protected by ranges_mutex
+	idx_t start = 0, end = 0; // range in remote blob file
+	idx_t file_offset = 0;  // Offset in the cache local file where this range is stored
+	idx_t usage_count = 0, bytes_from_cache = 0;  // statistics
 	duckdb::shared_ptr<SharedBuffer> memory_buffer;  // Temporary in-memory buffer until disk write completes
-	bool disk_write_complete = false;  // Whether the background disk write has completed
+	bool disk_write_complete = false;  // Whether the background disk write has completed (lock-free)
 	CacheRange(idx_t start, idx_t end) : start(start), end(end) {}
 };
 
 struct CacheEntry {
-	string filename;
+	string filename; // full URL
 	map<idx_t, duckdb::shared_ptr<CacheRange>> ranges;  // Map of start position to shared CacheRange
 	idx_t cached_file_size = 0;  // Total bytes cached for this file
 
@@ -70,11 +68,10 @@ private:
 	static constexpr idx_t DEFAULT_CACHE_CAPACITY = 1024ULL * 1024 * 1024; // 1GB default
 	
 	DatabaseInstance *db_instance;
-	string path_separator;
-	string cache_dir_path;
-	idx_t cache_capacity;
-	idx_t current_cache_size;
-	bool cache_initialized;
+	string path_separator; // make this work on windoze as well
+	string cache_dir_path; // local directory where the cached files are written
+	idx_t cache_capacity, current_cache_size, current_cache_ranges;
+	bool cache_initialized = false;
 	
 	// Cache state
 	unordered_map<string, unique_ptr<CacheEntry>> key_cache; // Maps cache key to CacheEntry
@@ -88,7 +85,7 @@ private:
 	bool conservative_mode; // True if blobcache_regexps is empty
 	
 	// Directory creation optimization
-	std::bitset<65536> subdirs_created; // Track which subdirectories have been created (16-bit hex = 65536 possibilities)
+	std::bitset<4095> subdirs_created; // Track which subdirectories have been created (12-bit prefix = 4095 possibilities)
 	
 	// Multi-threaded background cache writer system
 	static constexpr idx_t MAX_WRITER_THREADS = 256;
@@ -129,7 +126,7 @@ public:
 	// Constructor/Destructor
 	explicit BlobCache(DatabaseInstance *db_instance = nullptr)
 	    : db_instance(db_instance), path_separator("/"), cache_capacity(DEFAULT_CACHE_CAPACITY),
-	      current_cache_size(0), cache_initialized(false), conservative_mode(true),
+	      current_cache_size(0), current_cache_ranges(0), cache_initialized(false), conservative_mode(true),
 	      shutdown_writer_threads(false), database_shutting_down(false), num_writer_threads(1) {
 		// Don't start the cache writer threads in constructor to avoid potential deadlocks
 		// They will be started when needed in InitializeCache
@@ -147,24 +144,15 @@ public:
 	
 	// Logging methods with shutdown-safe null guards
 	void LogDebug(const string &message) const {
-		// Skip logging if database is shutting down to prevent access to destroyed instance
-		if (database_shutting_down.load()) {
-			return;
-		}
-		if (db_instance) {
+		if (!database_shutting_down.load() && db_instance) {
 			DUCKDB_LOG_DEBUG(*db_instance, "[BlobCache] %s", message.c_str());
 		}
 	}
 	void LogError(const string &message) const {
-		// Skip logging if database is shutting down to prevent access to destroyed instance
-		if (database_shutting_down.load()) {
-			return;
-		}
-		if (db_instance) {
+		if (!database_shutting_down.load() && db_instance) {
 			DUCKDB_LOG_ERROR(*db_instance, "[BlobCache] %s", message.c_str());
 		}
 	}
-
 	
 	// Core cache operations
 	void InsertCache(const string &cache_key, const string &filename, idx_t start_pos, const void *buffer, idx_t length);
@@ -180,6 +168,7 @@ public:
 		lru_head = nullptr;
 		lru_tail = nullptr;
 		current_cache_size = 0;
+		current_cache_ranges = 0;
 		subdirs_created.reset();
 	}
 	void InvalidateCache(const string &filename);
@@ -210,9 +199,9 @@ public:
 		idx_t usage_count;
 		idx_t bytes_from_cache;
 	};
-	
+
 	// Statistics
-	vector<RangeInfo> GetCacheStatistics(idx_t max_results = 10000) const;
+	vector<RangeInfo> GetCacheStatistics() const;
 	
 	// Configuration and caching policy
 	bool ShouldCacheFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) const;

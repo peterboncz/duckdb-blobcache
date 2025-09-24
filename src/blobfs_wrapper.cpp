@@ -1,6 +1,5 @@
 #include "blobfs_wrapper.hpp"
 #include "blobcache.hpp"
-#include "debug_filesystem.hpp"
 #include "duckdb/common/virtual_file_system.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/logging/logger.hpp"
@@ -24,7 +23,6 @@ unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileO
 			return make_uniq<BlobFileHandle>(*this, std::move(wrapped_handle), cache_key, cache);
 		}
 	}
-
 	return wrapped_handle;
 }
 
@@ -50,6 +48,11 @@ static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_hand
 		wrapped_fs.Seek(*blob_handle.wrapped_handle, location);
 		nr_read = wrapped_fs.Read(*blob_handle.wrapped_handle, buffer, nr_read);
 		blob_handle.cache->InsertCache(blob_handle.cache_key, blob_handle.wrapped_handle->GetPath(), location, buffer, nr_read);
+		if (nr_read && blob_handle.cache_key.substr(blob_handle.cache_key.find_last_of(':')) == ":debug") {
+			// inspired on AnyBlob paper: lowest latency is 20ms, transfer 12MB/s for the first MB, 40MB/s beyond that
+			uint64_t ms = (nr_read < (1<<20)) ? (20 + ((80*nr_read)>>20)) : (75 + ((25*nr_read) >> 20));
+			std::this_thread::sleep_for(std::chrono::milliseconds(ms)); // simulate S3 latency
+		}
 		location += nr_read;
 		nr_bytes += nr_read;
 	}

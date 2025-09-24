@@ -2,21 +2,25 @@
 
 namespace duckdb {
 
-static duckdb::shared_ptr<CacheRange> AnalyzeRange(CacheEntry *cache_entry, idx_t position, idx_t &max_nr_bytes) {
-	auto it = cache_entry->ranges.upper_bound(position);
+static duckdb::shared_ptr<CacheRange> AnalyzeRange(map<idx_t,duckdb::shared_ptr<CacheRange>> &ranges, idx_t position, idx_t &max_nr_bytes) {
+	auto it = ranges.upper_bound(position);
 	shared_ptr<CacheRange> hit_range;
 
-	if (it != cache_entry->ranges.begin()) { // is there a range that starts <= start_pos?
+	if (it != ranges.begin()) { // is there a range that starts <= start_pos?
 		auto prev_range = std::prev(it)->second;
 		if (prev_range->end > position &&  // it covers the start of this range
 		    prev_range->memory_buffer) { // range is only ready if this is filled
 			hit_range = prev_range; // so it is a hit
 		}
 	}
-	if (it != cache_entry->ranges.end() && it->second->start < position + max_nr_bytes) {
+	if (it != ranges.end() && it->second->start < position + max_nr_bytes) {
 		max_nr_bytes = it->second->start - position; // cut short our range because the end is already cached now
 	}
 	return hit_range;
+}
+
+static duckdb::shared_ptr<CacheRange> AnalyzeRange(CacheEntry *cache_entry, idx_t position, idx_t &max_nr_bytes) {
+	return AnalyzeRange(cache_entry->ranges, position, max_nr_bytes);
 }
 
 idx_t BlobCache::ReadFromCache(const string &cache_key, idx_t position, void *buffer, idx_t &max_nr_bytes) {
@@ -103,6 +107,7 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 		return; // decide not to cache after all
 	}
 	current_cache_size += actual_bytes;
+	current_cache_ranges++;
 
 	auto new_range = duckdb::make_shared_ptr<CacheRange>(start_pos, end_pos);
 	cache_entry->ranges[start_pos] = new_range;
@@ -116,63 +121,10 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 	std::memcpy(mem_buffer->data.get(), static_cast<const char*>(buffer) + offset, actual_bytes);
 	new_range->memory_buffer = mem_buffer; // lock-free assignment sequence: assign after copy
 
-	    // Queue for writing to disk
+	// Queue for writing to disk
 	QueueCacheWrite(cache_key, new_range);
 }
 
-void BlobCache::TryMergeWithPrevious(const string &cache_key, duckdb::shared_ptr<CacheRange> range) {
-	std::lock_guard<std::mutex> lock(cache_mutex);
-
-	auto cache_it = key_cache.find(cache_key);
-	if (cache_it == key_cache.end()) {
-		return; // Cache entry was evicted
-	}
-	CacheEntry* cache_entry = cache_it->second.get();
-
-	// Find the range that was just written (by start position)
-	auto current_it = cache_entry->ranges.find(range->start);
-	if (current_it == cache_entry->ranges.end()) {
-		return; // Range was evicted
-	}
-
-	// Check if there's a previous range that ends exactly where this one starts
-	if (current_it == cache_entry->ranges.begin()) {
-		return; // No previous range
-	}
-
-	auto prev_it = std::prev(current_it);
-	auto prev_range = prev_it->second;
-
-	// Check three conditions:
-	// 1. Previous range ends exactly where current range starts (adjacent in original file)
-	// 2. Previous range is already written to disk
-	// 3. Previous range and current range are contiguous in the cache file
-	if (prev_range->end != range->start) {
-		return; // Not adjacent in original file
-	}
-
-	if (!prev_range->disk_write_complete) {
-		return; // Previous range not yet written to disk
-	}
-
-	// Check if the ranges are contiguous in the cache file
-	// The end of prev_range in cache file should be exactly where current range starts
-	idx_t prev_range_size = prev_range->end - prev_range->start;
-	if (prev_range->file_offset + prev_range_size != range->file_offset) {
-		return; // Not contiguous in cache file
-	}
-
-	// We can merge! Extend the previous range and remove the current range
-	LogDebug(StringUtil::Format("[BlobCache] Merging adjacent ranges: [%llu,%llu] + [%llu,%llu]",
-	                            prev_range->start, prev_range->end, range->start, range->end));
-
-	prev_range->end = range->end;
-	prev_range->usage_count += range->usage_count;
-	prev_range->bytes_from_cache += range->bytes_from_cache;
-
-	// Remove the current range
-	cache_entry->ranges.erase(current_it);
-}
 
 //===----------------------------------------------------------------------===//
 // Multi-threaded background cache writer implementation
@@ -290,7 +242,6 @@ bool BlobCache::HasUnfinishedWrites(const string &cache_key) {
 }
 
 // LRU List Management methods moved to inline implementations in blobcache.hpp
-
 bool BlobCache::EvictToCapacity(idx_t required_space, const string &exclude_key) {
 	// Try to evict entries to make space, returns true if successful
 	// Skip entries with unfinished writes and the exclude_key
@@ -361,9 +312,10 @@ void BlobCache::EvictKey(const string &cache_key) {
 			}
 		}
 		// Safe to evict - ranges_mutex is locked so no other thread is using this entry
+		current_cache_size -= file_bytes;
+		current_cache_ranges -= cache_it->second->ranges.size();
 		RemoveFromLRU(cache_it->second.get());
 		key_cache.erase(cache_it);
-		current_cache_size -= file_bytes;
 	}
 	DeleteCacheFile(cache_key);
 }
@@ -471,53 +423,34 @@ void BlobCache::ConfigureCache(const string &directory, idx_t max_size_bytes, id
 	                           cache_dir_path.c_str(), cache_capacity, writer_threads));
 }
 
-vector<BlobCache::RangeInfo> BlobCache::GetCacheStatistics(idx_t max_results) const {
+vector<BlobCache::RangeInfo> BlobCache::GetCacheStatistics() const {
 	std::lock_guard<std::mutex> lock(cache_mutex);
 	vector<RangeInfo> range_infos;
 	if (!cache_initialized) {
 		return range_infos;
 	}
-	range_infos.reserve(max_results);
+	range_infos.reserve(current_cache_ranges);
 
 	// Collect cache entries in LRU order (least recently used first)
 	CacheEntry* current = lru_tail;
-	while (current && range_infos.size() < max_results) {
-		// Find the cache key for this entry
-		string cache_key;
-		for (const auto& kv : key_cache) {
-			if (kv.second.get() == current) {
-				cache_key = kv.first;
-				break;
-			}
+	while (current) {
+		RangeInfo info;
+		info.protocol = "unknown";
+		info.filename = current->filename;
+		auto pos = info.filename.find_first_of("://");
+		if (pos < info.filename.length()) {
+			info.protocol = info.filename.substr(0, pos);
+			info.filename = info.filename.substr(pos + 3,info.filename.length() - (pos + 3));
 		}
-
-		if (!cache_key.empty()) {
-			for (const auto &range_pair : current->ranges) {
-				const auto &range = range_pair.second;
-				RangeInfo info;
-				// Extract protocol from cache key
-				// Cache key format: hash-filename-protocol, search backwards for last '-'
-				info.protocol = "unknown"; // Default
-				info.filename = current->filename;
-				size_t last_dash = cache_key.find_last_of('-');
-				if (last_dash != string::npos && last_dash < cache_key.length() - 1) {
-					info.protocol = cache_key.substr(last_dash + 1);
-				}
-				info.file_offset = range->file_offset;
-				info.start = range->start;
-				info.end = range->end;
-				info.usage_count = range->usage_count;
-				info.bytes_from_cache = range->bytes_from_cache;
-				range_infos.push_back(info);
-
-				// Early exit if we have enough results
-				if (range_infos.size() >= max_results) {
-					return range_infos;
-				}
-			}
+		for (const auto &range_pair : current->ranges) {
+			info.file_offset = range_pair.second->file_offset;
+			info.start = range_pair.second->start;
+			info.end = range_pair.second->end;
+			info.usage_count = range_pair.second->usage_count;
+			info.bytes_from_cache = range_pair.second->bytes_from_cache;
+			range_infos.push_back(info);
 		}
-		// Move to next entry in LRU order
-		current = current->lru_prev;
+		current = current->lru_prev; // Move to next entry in LRU order
 	}
 	return range_infos;
 }

@@ -2,7 +2,6 @@
 
 #include "blobcache_extension.hpp"
 #include "blobfs_wrapper.hpp"
-#include "duckdb.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
 namespace duckdb {
@@ -229,32 +228,20 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 	
 	// Load data on first call (when tuples_processed == 0)
 	if (global_state.tuples_processed == 0) {
-		auto shared_cache = GetOrCreateBlobCache(*context.db);
-		if (shared_cache && shared_cache->IsCacheInitialized()) {
-			// Get all cache statistics using the helper function
-			global_state.range_infos = shared_cache->GetCacheStatistics(10000);
-		}
+		global_state.range_infos = GetOrCreateBlobCache(*context.db)->GetCacheStatistics();
 	}
 	
 	// Calculate how many rows to output in this chunk
-	idx_t total_rows = global_state.range_infos.size();
-	idx_t start_idx = global_state.tuples_processed;
-	
-	// If we've already output all rows, return empty
-	if (start_idx >= total_rows) {
-		output.SetCardinality(0);
-		return;
+	idx_t chunk_size = static_cast<idx_t>(STANDARD_VECTOR_SIZE);
+	if (global_state.tuples_processed + chunk_size > global_state.range_infos.size()) {
+		chunk_size = global_state.range_infos.size() - global_state.tuples_processed;
 	}
-	
-	// Determine chunk size (up to STANDARD_VECTOR_SIZE which is 2048)
-	idx_t chunk_size = std::min(static_cast<idx_t>(STANDARD_VECTOR_SIZE), total_rows - start_idx);
 	output.SetCardinality(chunk_size);
-	
+
 	// Fill the output chunk directly from range_infos
 	for (idx_t i = 0; i < chunk_size; i++) {
-		idx_t row_idx = start_idx + i;
+		idx_t row_idx = global_state.tuples_processed + i;
 		const auto &info = global_state.range_infos[row_idx];
-
 		output.data[0].SetValue(i, Value(info.protocol));
 		output.data[1].SetValue(i, Value(info.filename));
 		output.data[2].SetValue(i, Value::BIGINT(static_cast<int64_t>(info.file_offset)));
@@ -263,8 +250,6 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 		output.data[5].SetValue(i, Value::BIGINT(static_cast<int64_t>(info.usage_count)));
 		output.data[6].SetValue(i, Value::BIGINT(static_cast<int64_t>(info.bytes_from_cache)));
 	}
-	
-	// Update the processed count
 	global_state.tuples_processed += chunk_size;
 }
 
