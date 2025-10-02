@@ -14,23 +14,21 @@ namespace duckdb {
 struct BlobCacheConfigBindData : public FunctionData {
 	string directory;
 	idx_t max_size_mb;
-	idx_t writer_threads;
 	string regex_patterns; // New regex patterns parameter
 	bool query_only; // True if no parameters provided - just query current values
 	
-	BlobCacheConfigBindData(string dir, idx_t size, idx_t threads, string regexps = "", bool query = false) 
-		: directory(std::move(dir)), max_size_mb(size), writer_threads(threads), 
+	BlobCacheConfigBindData(string dir, idx_t size, string regexps = "", bool query = false)
+		: directory(std::move(dir)), max_size_mb(size),
 		  regex_patterns(std::move(regexps)), query_only(query) {}
 	
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<BlobCacheConfigBindData>(directory, max_size_mb, writer_threads, regex_patterns, query_only);
+		return make_uniq<BlobCacheConfigBindData>(directory, max_size_mb, regex_patterns, query_only);
 	}
 	
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<BlobCacheConfigBindData>();
 		return directory == other.directory && max_size_mb == other.max_size_mb && 
-		       writer_threads == other.writer_threads && regex_patterns == other.regex_patterns && 
-		       query_only == other.query_only;
+		       regex_patterns == other.regex_patterns && query_only == other.query_only;
 	}
 };
 
@@ -52,14 +50,12 @@ static unique_ptr<FunctionData> BlobCacheConfigBind(ClientContext &context, Tabl
 	// Setup return schema - returns useful cache statistics
 	return_types.push_back(LogicalType::VARCHAR);   // cache_path
 	return_types.push_back(LogicalType::BIGINT);    // max_size_bytes
-	return_types.push_back(LogicalType::BIGINT);    // current_size_bytes
-	return_types.push_back(LogicalType::BIGINT);    // writer_threads
+	return_types.push_back(LogicalType::BIGINT);    // current_cache_size_bytes
 	return_types.push_back(LogicalType::BOOLEAN);   // success
-	
+
 	names.push_back("cache_path");
 	names.push_back("max_size_bytes");
-	names.push_back("current_size_bytes");
-	names.push_back("writer_threads");
+	names.push_back("current_cache_size_bytes");
 	names.push_back("success");
 	
 	string directory = ".blobcache"; // Default
@@ -97,33 +93,16 @@ static unique_ptr<FunctionData> BlobCacheConfigBind(ClientContext &context, Tabl
 	
 	if (input.inputs.size() >= 3) {
 		if (input.inputs[2].IsNull()) {
-			throw BinderException("blobcache_config: writer_threads cannot be NULL");
-		}
-		auto threads_val = input.inputs[2];
-		if (threads_val.type().id() != LogicalTypeId::BIGINT && threads_val.type().id() != LogicalTypeId::INTEGER) {
-			throw BinderException("blobcache_config: writer_threads must be an integer");
-		}
-		writer_threads = threads_val.GetValue<idx_t>();
-		if (writer_threads <= 0) {
-			throw BinderException("blobcache_config: writer_threads must be positive");
-		}
-		if (writer_threads > 256) {
-			throw BinderException("blobcache_config: writer_threads cannot exceed 256");
-		}
-	}
-	
-	if (input.inputs.size() >= 4) {
-		if (input.inputs[3].IsNull()) {
 			throw BinderException("blobcache_config: regex_patterns cannot be NULL");
 		}
-		auto patterns_val = input.inputs[3];
+		auto patterns_val = input.inputs[2];
 		if (patterns_val.type().id() != LogicalTypeId::VARCHAR) {
 			throw BinderException("blobcache_config: regex_patterns must be a string");
 		}
 		regex_patterns = StringValue::Get(patterns_val);
 	}
 	
-	return make_uniq<BlobCacheConfigBindData>(std::move(directory), max_size_mb, writer_threads, std::move(regex_patterns), query_only);
+	return make_uniq<BlobCacheConfigBindData>(std::move(directory), max_size_mb, std::move(regex_patterns), query_only);
 }
 
 // Init function for blobcache_config global state
@@ -176,7 +155,7 @@ static void BlobCacheConfigFunction(ClientContext &context, TableFunctionInput &
 	bool success = false;
 	string cache_path = "";
 	idx_t max_size_bytes = 0;
-	idx_t current_size_bytes = 0;
+	idx_t current_cache_size_bytes = 0;
 	idx_t writer_threads = 0;
 	
 	if (data_p.bind_data && shared_cache) {
@@ -189,10 +168,10 @@ static void BlobCacheConfigFunction(ClientContext &context, TableFunctionInput &
 		} else {
 			// Configuration mode - actually configure the cache
 			DUCKDB_LOG_DEBUG(*context.db, "[BlobCache] Configuring cache: directory='%s', max_size=%zu MB, writer_threads=%zu, regex_patterns='%s'",
-							  bind_data.directory.c_str(), bind_data.max_size_mb, bind_data.writer_threads, bind_data.regex_patterns.c_str());
+							  bind_data.directory.c_str(), bind_data.max_size_mb, bind_data.regex_patterns.c_str());
 
 			// Configure cache first
-			shared_cache->ConfigureCache(bind_data.directory, bind_data.max_size_mb * 1024 * 1024, bind_data.writer_threads);
+			shared_cache->ConfigureCache(bind_data.directory, bind_data.max_size_mb * 1024 * 1024);
 			
 			// Update regex patterns and purge non-qualifying cache entries
 			shared_cache->UpdateRegexPatterns(bind_data.regex_patterns);
@@ -207,17 +186,16 @@ static void BlobCacheConfigFunction(ClientContext &context, TableFunctionInput &
 	if (shared_cache && shared_cache->IsCacheInitialized()) {
 		cache_path = shared_cache->GetCachePath();
 		max_size_bytes = shared_cache->GetMaxSizeBytes();
-		current_size_bytes = shared_cache->GetCurrentSizeBytes();
-		writer_threads = shared_cache->GetWriterThreadCount();
+		current_cache_size_bytes = shared_cache->GetCurrentCacheSize();
 	}
 	
 	// Return the statistics tuple
 	output.SetCardinality(1);
-	output.data[0].SetValue(0, Value(cache_path));                    // cache_path
-	output.data[1].SetValue(0, Value::BIGINT(max_size_bytes));        // max_size_bytes
-	output.data[2].SetValue(0, Value::BIGINT(current_size_bytes));    // current_size_bytes
-	output.data[3].SetValue(0, Value::BIGINT(writer_threads));        // writer_threads
-	output.data[4].SetValue(0, Value::BOOLEAN(success));              // success
+	output.data[0].SetValue(0, Value(cache_path));                       // cache_path
+	output.data[1].SetValue(0, Value::BIGINT(max_size_bytes));           // max_size_bytes
+	output.data[2].SetValue(0, Value::BIGINT(current_cache_size_bytes));   // current_cache_size_bytes
+	output.data[3].SetValue(0, Value::BIGINT(writer_threads));           // writer_threads
+	output.data[4].SetValue(0, Value::BOOLEAN(success));                 // success
 	global_state.tuples_processed = 1;
 }
 
@@ -293,8 +271,6 @@ void BlobcacheExtension::Load(DuckDB &db) {
 	blobcache_stats_function.init_global = BlobCacheStatsInitGlobal;
 	ExtensionUtil::RegisterFunction(instance, blobcache_stats_function);
 	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Registered blobcache_stats function");
-	
-	
 
 	// Register extension callback for automatic wrapping
 	config.extension_callbacks.push_back(make_uniq<BlobCacheExtensionCallback>());

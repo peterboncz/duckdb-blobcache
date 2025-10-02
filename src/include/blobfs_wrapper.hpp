@@ -42,10 +42,10 @@ public:
 //===----------------------------------------------------------------------===//
 class BlobFileHandle : public FileHandle {
 public:
-	BlobFileHandle(FileSystem &fs, unique_ptr<FileHandle> wrapped_handle, string cache_key,
+	BlobFileHandle(FileSystem &fs, unique_ptr<FileHandle> wrapped_handle, string filename,
 	               shared_ptr<BlobCache> cache)
 	    : FileHandle(fs, wrapped_handle->GetPath(), wrapped_handle->GetFlags()),
-	      wrapped_handle(std::move(wrapped_handle)), cache_key(std::move(cache_key)),
+	      wrapped_handle(std::move(wrapped_handle)), filename(std::move(filename)),
 	      cache(cache), file_position(0) {
 	}
 
@@ -59,7 +59,7 @@ public:
 
 public:
 	unique_ptr<FileHandle> wrapped_handle;
-	string cache_key;
+	string filename;  // Full filename with protocol prefix
 	shared_ptr<BlobCache> cache;
 	idx_t file_position;  // Track our own file position
 };
@@ -177,14 +177,6 @@ public:
 		return wrapped_fs->OpenCompressedFile(std::move(handle), write);
 	}
 
-	// Statistics helper
-	static string GetProtocolFromKey(const string &cache_key) {
-		auto suffix_pos = cache_key.rfind(':');
-		if (suffix_pos != string::npos) {
-			return cache_key.substr(suffix_pos + 1);
-		}
-		return "";
-	}
 private:
 	unique_ptr<FileSystem> wrapped_fs;
 	shared_ptr<BlobCache> cache;

@@ -19,8 +19,7 @@ unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileO
 
 	if (cache->IsCacheInitialized() && flags.OpenForReading() && !flags.OpenForWriting()) {
 		if (cache->ShouldCacheFile(path, opener)) {
-			string cache_key = cache->GenerateCacheKey(path);
-			return make_uniq<BlobFileHandle>(*this, std::move(wrapped_handle), cache_key, cache);
+			return make_uniq<BlobFileHandle>(*this, std::move(wrapped_handle), path, cache);
 		}
 	}
 	return wrapped_handle;
@@ -28,7 +27,7 @@ unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileO
 
 static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_handle, char* buffer, idx_t location, idx_t max_nr_bytes) {
 	// NOTE: ReadFromCache() can return cached_bytes == 0 but adjust max_nr_bytes downwards to align with a cached range
-	idx_t nr_bytes = blob_handle.cache->ReadFromCache(blob_handle.cache_key, location, buffer, max_nr_bytes);
+	idx_t nr_bytes = blob_handle.cache->ReadFromCache(blob_handle.filename, location, buffer, max_nr_bytes);
 #if 0
     if (nr_bytes > 0) { // debug
 		char *tmp_buffer = new char[nr_bytes];
@@ -47,8 +46,8 @@ static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_hand
 		idx_t nr_read = max_nr_bytes - nr_bytes;
 		wrapped_fs.Seek(*blob_handle.wrapped_handle, location);
 		nr_read = wrapped_fs.Read(*blob_handle.wrapped_handle, buffer, nr_read);
-		blob_handle.cache->InsertCache(blob_handle.cache_key, blob_handle.wrapped_handle->GetPath(), location, buffer, nr_read);
-		if (nr_read && blob_handle.cache_key.substr(blob_handle.cache_key.find_last_of(':')) == ":debug") {
+		blob_handle.cache->InsertCache(blob_handle.filename, location, buffer, nr_read);
+		if (nr_read && blob_handle.filename.find("debug://") == 0) {
 			// inspired on AnyBlob paper: lowest latency is 20ms, transfer 12MB/s for the first MB, 40MB/s beyond that
 			uint64_t ms = (nr_read < (1<<20)) ? (20 + ((80*nr_read)>>20)) : (75 + ((25*nr_read) >> 20));
 			std::this_thread::sleep_for(std::chrono::milliseconds(ms)); // simulate S3 latency
@@ -89,7 +88,7 @@ int64_t BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr
 void BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
 	if (blob_handle.cache) {
-		blob_handle.cache->InvalidateCache(blob_handle.cache_key);
+		blob_handle.cache->InvalidateCachedFile(blob_handle.filename);
 	}
 	wrapped_fs->Write(*blob_handle.wrapped_handle, buffer, nr_bytes, location);
 	// Update position after write at explicit location
@@ -99,7 +98,7 @@ void BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t nr_b
 int64_t BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
 	if (blob_handle.cache) {
-		blob_handle.cache->InvalidateCache(blob_handle.cache_key);
+		blob_handle.cache->InvalidateCachedFile(blob_handle.filename);
 	}
 	int64_t bytes_written = wrapped_fs->Write(*blob_handle.wrapped_handle, buffer, nr_bytes);
 	if (bytes_written > 0) {
@@ -111,22 +110,22 @@ int64_t BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t n
 void BlobFilesystemWrapper::Truncate(FileHandle &handle, int64_t new_size) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
 	if (blob_handle.cache) {
-		blob_handle.cache->InvalidateCache(blob_handle.cache_key);
+		blob_handle.cache->InvalidateCachedFile(blob_handle.filename);
 	}
 	wrapped_fs->Truncate(*blob_handle.wrapped_handle, new_size);
 }
 
 void BlobFilesystemWrapper::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
-	if (cache) {
-		cache->InvalidateCache(cache->GenerateCacheKey(source));
-		cache->InvalidateCache(cache->GenerateCacheKey(target));
+	if (cache && cache->IsCacheInitialized()) {
+		cache->InvalidateCachedFile(source);
+		cache->InvalidateCachedFile(target);
 	}
 	wrapped_fs->MoveFile(source, target, opener);
 }
 
 void BlobFilesystemWrapper::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
-	if (cache) {
-		cache->InvalidateCache(cache->GenerateCacheKey(filename));
+	if (cache && cache->IsCacheInitialized()) {
+		cache->InvalidateCachedFile(filename);
 	}
 	wrapped_fs->RemoveFile(filename, opener);
 }
