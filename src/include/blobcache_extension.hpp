@@ -2,7 +2,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
-#include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 #include "duckdb/main/config.hpp"
 #include "blobcache.hpp"
@@ -12,7 +12,7 @@ namespace duckdb {
 
 class BlobcacheExtension : public Extension {
 public:
-	void Load(DuckDB &db) override;
+	void Load(ExtensionLoader &loader) override;
 	std::string Name() override {
 		return "blobcache";
 	}

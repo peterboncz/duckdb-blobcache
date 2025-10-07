@@ -1,59 +1,89 @@
 # name: test/sql/blobcache.test
 # description: test blobcache extension
 # group: [sql]
-
 require blobcache
 
 require parquet
 
 statement ok
-install httpfs
+install tpch
 
 statement ok
-load httpfs
+load tpch
 
 statement ok
-set threads = 1
+call dbgen(sf=0.3);
 
 statement ok
-CALL blobcache_config('.blobcache-filedebug', 256);
+copy lineitem to 'lineitem.parquet';
 
 statement ok
-select ps_comment from read_parquet('debug:///Users/peter/duckdb-blobcache/partsupp.parquet');
+select max(l_comment) from read_parquet('debug://lineitem.parquet');
+
+query III
+select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
+----
+large	16	0
+small	16	0
 
 statement ok
-select ps_comment from read_parquet('debug:///Users/peter/duckdb-blobcache/partsupp.parquet');
+select max(l_comment) from read_parquet('debug://lineitem.parquet');
+
+query III
+select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
+----
+large	16	16
+small	16	16	
 
 statement ok
-select count(*) from read_csv('debug:///Users/peter/duckdb-blobcache/weather.csv');
+set enable_external_file_cache = false;
 
-# Test that blobcache extension is properly loaded and table functions work  
-# Enable aggressive mode to cache CSV files (conservative mode by default only caches parquet)
 statement ok
-CALL blobcache_config('/tmp/blobcache_test', 256, 1, '\.csv$');
+select max(l_comment) from read_parquet('debug://lineitem.parquet');
 
-# Test that blobcache_stats table function works (should return empty initially)
+query III
+select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
+----
+large	16	32
+small	16	33
+
 statement ok
-FROM blobcache_stats();
+from blobcache_config('.blobcache', 1);
 
-# Test filesystem wrapper integration with cache
 query I
-SELECT count(*) FROM 'https://raw.githubusercontent.com/duckdb/duckdb/refs/heads/main/data/csv/weather.csv' LIMIT 1
+select count(*) from blobcache_stats() group by all;
 ----
-366
+0
 
-# Wait for background cache processing
 statement ok
-SELECT count(*) FROM range(1000000)
+select max(l_comment) from read_parquet('debug://lineitem.parquet');
 
-# Verify that cache statistics show the cached data
+query III
+select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
+----
+large	1	0
+small	16	1
+
+statement ok
+select max(l_comment) from read_parquet('debug://lineitem.parquet');
+
+query III
+select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
+----
+large	1	1
+small	16	18
+
+query IIIII
+from blobcache_config()
+----
+.blobcache/	1048576	28067	1	1
+
 query I
-SELECT count(*) FROM blobcache_stats() WHERE filename LIKE '%weather.csv%'
+select sum("end" - "start") from blobcache_stats();
 ----
-1
+28067
 
-# Verify that cache data was actually stored 
-query I  
-SELECT CASE WHEN start >= 0 AND "end" > start THEN 1 ELSE 0 END as valid_range FROM blobcache_stats() WHERE filename LIKE '%weather.csv%'
+query IIIII
+from blobcache_config('.blobcache/', 1024, 255);
 ----
-1
+.blobcache/	1073741824	0	255	1

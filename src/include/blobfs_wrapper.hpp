@@ -13,7 +13,7 @@
 namespace duckdb {
 
 // Forward declarations
-class BlobCache;
+struct BlobCache;
 class BlobFileHandle;
 
 //===----------------------------------------------------------------------===//
@@ -42,11 +42,11 @@ public:
 //===----------------------------------------------------------------------===//
 class BlobFileHandle : public FileHandle {
 public:
-	BlobFileHandle(FileSystem &fs, unique_ptr<FileHandle> wrapped_handle, string cache_key,
+	BlobFileHandle(FileSystem &fs, string original_path, unique_ptr<FileHandle> wrapped_handle, string cache_key,
 	               shared_ptr<BlobCache> cache)
 	    : FileHandle(fs, wrapped_handle->GetPath(), wrapped_handle->GetFlags()),
 	      wrapped_handle(std::move(wrapped_handle)), cache_key(std::move(cache_key)),
-	      cache(cache), file_position(0) {
+	      cache(cache), original_path(std::move(original_path)), file_position(0) {
 	}
 
 	~BlobFileHandle() override = default;
@@ -61,6 +61,7 @@ public:
 	unique_ptr<FileHandle> wrapped_handle;
 	string cache_key;
 	shared_ptr<BlobCache> cache;
+	string original_path;  // Store original path with protocol prefix
 	idx_t file_position;  // Track our own file position
 };
 
@@ -88,14 +89,28 @@ public:
 	void Truncate(FileHandle &handle, int64_t new_size) override;
 	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
+	bool TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override {
+		if (cache) {
+			cache->EvictFile(filename);
+		}
+		return wrapped_fs->TryRemoveFile(filename, opener);
+	}
+	bool Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) override {
+		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		return wrapped_fs->Trim(*blob_handle.wrapped_handle, offset_bytes, length_bytes);
+	}
 
 	int64_t GetFileSize(FileHandle &handle) override {
 		auto &blob_handle = handle.Cast<BlobFileHandle>();
 		return wrapped_fs->GetFileSize(*blob_handle.wrapped_handle);
 	}
-	time_t GetLastModifiedTime(FileHandle &handle) override {
+	timestamp_t GetLastModifiedTime(FileHandle &handle) override {
 		auto &blob_handle = handle.Cast<BlobFileHandle>();
 		return wrapped_fs->GetLastModifiedTime(*blob_handle.wrapped_handle);
+	}
+	string GetVersionTag(FileHandle &handle) override {
+		auto &blob_handle = handle.Cast<BlobFileHandle>();
+		return wrapped_fs->GetVersionTag(*blob_handle.wrapped_handle);
 	}
 	FileType GetFileType(FileHandle &handle) override {
 		auto &blob_handle = handle.Cast<BlobFileHandle>();
@@ -136,6 +151,9 @@ public:
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
 		wrapped_fs->CreateDirectory(directory, opener);
 	}
+	void CreateDirectoriesRecursive(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		wrapped_fs->CreateDirectoriesRecursive(path, opener);
+	}
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
 		wrapped_fs->RemoveDirectory(directory, opener);
 	}
@@ -161,6 +179,9 @@ public:
 	void UnregisterSubSystem(const string &name) override {
 		wrapped_fs->UnregisterSubSystem(name);
 	}
+	unique_ptr<FileSystem> ExtractSubSystem(const string &name) override {
+		return wrapped_fs->ExtractSubSystem(name);
+	}
 	vector<string> ListSubSystems() override {
 		return wrapped_fs->ListSubSystems();
 	}
@@ -173,8 +194,23 @@ public:
 	string PathSeparator(const string &path) override {
 		return wrapped_fs->PathSeparator(path);
 	}
-	unique_ptr<FileHandle> OpenCompressedFile(unique_ptr<FileHandle> handle, bool write) override {
-		return wrapped_fs->OpenCompressedFile(std::move(handle), write);
+	string GetHomeDirectory() override {
+		return wrapped_fs->GetHomeDirectory();
+	}
+	string ExpandPath(const string &path) override {
+		return wrapped_fs->ExpandPath(path);
+	}
+	bool IsManuallySet() override {
+		return wrapped_fs->IsManuallySet();
+	}
+	void SetDisabledFileSystems(const vector<string> &names) override {
+		wrapped_fs->SetDisabledFileSystems(names);
+	}
+	bool SubSystemIsDisabled(const string &name) override {
+		return wrapped_fs->SubSystemIsDisabled(name);
+	}
+	unique_ptr<FileHandle> OpenCompressedFile(QueryContext context, unique_ptr<FileHandle> handle, bool write) override {
+		return wrapped_fs->OpenCompressedFile(context, std::move(handle), write);
 	}
 
 	// Statistics helper

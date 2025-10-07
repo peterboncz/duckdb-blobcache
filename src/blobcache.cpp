@@ -2,15 +2,65 @@
 
 namespace duckdb {
 
-static duckdb::shared_ptr<CacheRange> AnalyzeRange(map<idx_t,duckdb::shared_ptr<CacheRange>> &ranges, idx_t position, idx_t &max_nr_bytes) {
+//===----------------------------------------------------------------------===//
+// CacheConfig - Configuration and utility methods
+//===----------------------------------------------------------------------===//
+
+bool CacheConfig::CleanCacheDir() const {
+	DIR *dir = opendir(cache_dir.c_str());
+	if (!dir) {
+		return true;
+	}
+	auto success = true; // try to delete everything
+	struct dirent *entry;
+	while ((entry = readdir(dir)) != nullptr) {
+		// Skip . and ..
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+			continue;
+		}
+		string subdir_path = cache_dir + path_sep + entry->d_name;
+
+		// Remove all files in subdirectory
+		DIR *subdir = opendir(subdir_path.c_str());
+		if (subdir) {
+			struct dirent *subentry;
+			while ((subentry = readdir(subdir)) != nullptr) {
+				if (strcmp(subentry->d_name, ".") == 0 || strcmp(subentry->d_name, "..") == 0) {
+					continue;
+				}
+				string file_path = subdir_path + path_sep + subentry->d_name;
+				if (unlink(file_path.c_str()) != 0) {
+					success = false;
+				}
+			}
+			closedir(subdir);
+		}
+		// Remove subdirectory
+		if (rmdir(subdir_path.c_str()) != 0) {
+			success = false;
+		}
+	}
+	closedir(dir);
+	return success;
+}
+
+
+//===----------------------------------------------------------------------===//
+// AnalyzeRange that helps with Inserting and Reading ranges from a cache
+//===----------------------------------------------------------------------===//
+
+static CacheRange* AnalyzeRange(map<idx_t,unique_ptr<CacheRange>> &ranges, idx_t position, idx_t &max_nr_bytes) {
 	auto it = ranges.upper_bound(position);
-	shared_ptr<CacheRange> hit_range;
+	CacheRange* hit_range = nullptr;
 
 	if (it != ranges.begin()) { // is there a range that starts <= start_pos?
-		auto prev_range = std::prev(it)->second;
-		if (prev_range->end > position &&  // it covers the start of this range
-		    prev_range->memory_buffer) { // range is only ready if this is filled
-			hit_range = prev_range; // so it is a hit
+		auto &prev_range = std::prev(it)->second;
+		if (prev_range->end > position) {  // it covers the start of this range
+			// Check if write completed or buffer available
+			idx_t offset_value = prev_range->file_offset.load(std::memory_order_acquire);
+			if (prev_range->memory_buffer || offset_value != CacheRange::WRITE_NOT_COMPLETED_YET) {
+				hit_range = prev_range.get(); // so it is a hit
+			}
 		}
 	}
 	if (it != ranges.end() && it->second->start < position + max_nr_bytes) {
@@ -19,83 +69,68 @@ static duckdb::shared_ptr<CacheRange> AnalyzeRange(map<idx_t,duckdb::shared_ptr<
 	return hit_range;
 }
 
-static duckdb::shared_ptr<CacheRange> AnalyzeRange(CacheEntry *cache_entry, idx_t position, idx_t &max_nr_bytes) {
-	return AnalyzeRange(cache_entry->ranges, position, max_nr_bytes);
-}
+idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename,
+                               idx_t position, void *buffer, idx_t &max_nr_bytes) {
+	// Determine which cache to use based on request size
+	CacheType cache_type = (max_nr_bytes <= config.small_range_threshold) ? CacheType::SMALL_RANGE : CacheType::LARGE_RANGE;
+	CacheMap &cache = GetCacheMap(cache_type);
 
-idx_t BlobCache::ReadFromCache(const string &cache_key, idx_t position, void *buffer, idx_t &max_nr_bytes) {
-	duckdb::shared_ptr<SharedBuffer> mem_buffer = nullptr; // if set, read from temp in-memory write-buffer
-	duckdb::shared_ptr<CacheRange> hit_range = nullptr;
-	idx_t offset = 0, hit_size = 0;
-	{
-		std::lock_guard<std::mutex> lock(cache_mutex);
+	std::unique_lock<std::mutex> lock(cache_mutex); // lock caches
 
-		auto cache_it = key_cache.find(cache_key);
-		if (cache_it == key_cache.end()) {
-			return 0; // No cache entry
-		}
-		CacheEntry* cache_entry = cache_it->second.get();
-		hit_range = AnalyzeRange(cache_entry, position, max_nr_bytes); // adjusts lo and hi potentially
-		if (hit_range) { // hit
-			hit_size = std::min(max_nr_bytes, hit_range->end - position);
-			TouchLRU(cache_entry);
-
-			hit_range->bytes_from_cache += hit_size;
-			hit_range->usage_count++;
-			offset = position - hit_range->start;
-			if (!hit_range->disk_write_complete) {
-				mem_buffer = hit_range->memory_buffer; // create shared_ptr ref to mem_buffer under lock
-			}
-		}
+	CacheEntry *cache_entry = cache.FindCacheEntry(cache_key, filename);
+	if (!cache_entry) {
+		return 0; // nothing cached for this file
 	}
-	// All locks released here
-	if (hit_range) {
-		if (mem_buffer) { // read from shared_ptr buffer (in progress write)
-			std::memcpy(buffer, mem_buffer->data.get() + offset, hit_size);
-		} else if (!ReadFromCacheFile(cache_key, hit_range->file_offset + offset, buffer, hit_size)) {
-			hit_size = 0; // read from cached file failed!
+	cache.TouchLRU(cache_entry);
+	auto hit_range = AnalyzeRange(cache_entry->ranges, position, max_nr_bytes);
+	if (!hit_range) {
+		return 0; // some data is cached, but there is no overlapping range
+	}
+	idx_t hit_size = std::min(max_nr_bytes, hit_range->end - position);
+	idx_t offset = position - hit_range->start;
+	hit_range->bytes_from_cache += hit_size;
+	hit_range->usage_count++;
+
+	// CRITICAL: Copy everything we need before unlocking
+	idx_t cached_file_offset = hit_range->file_offset.load(std::memory_order_acquire);
+	bool write_in_progress = (cached_file_offset == CacheRange::WRITE_NOT_COMPLETED_YET);
+	duckdb::shared_ptr<CacheFileBuffer> mem_buffer = write_in_progress ? hit_range->memory_buffer : nullptr;
+	auto entry_id = cache_entry->entry_id;
+	lock.unlock(); // do the longer-running things unlocked (note: cache_entry might get deleted!)
+
+	if (mem_buffer) { // read from shared_ptr buffer that we got under lock above (for in progress write)
+		std::memcpy(buffer, mem_buffer->data.get() + offset, hit_size);
+	} else { // write has (long) finished. Read from the cache.
+		string cache_filepath = config.GenCacheFilePath(entry_id, cache_key, cache_type);
+		if (!cache.ReadFromCacheFile(cache_filepath, cached_file_offset + offset, buffer, hit_size)) {
+			hit_size = 0; // read from cached file failed! -- can be legal as it could have been deleted by eviction
 		}
 	}
 	return hit_size; // No cache hit, return 0 to indicate wrapped_fs should be used
 }
 
-void BlobCache::InvalidateCache(const string &filename) {
-	if (!cache_initialized) {
-		return; // Early exit if cache is not initialized - no need to invalidate
-	}
-	std::lock_guard<std::mutex> lock(cache_mutex);
-	EvictFile(filename);
-}
+void BlobCache::InsertCache(const string &cache_key, const string &filename, idx_t position, void *buffer, idx_t max_nr_bytes) {
+	// Determine cache type based on original request size
+	CacheType cache_type = (max_nr_bytes <= config.small_range_threshold) ? CacheType::SMALL_RANGE : CacheType::LARGE_RANGE;
+	CacheMap& cache = GetCacheMap(cache_type);
 
-void BlobCache::InsertCache(const string &cache_key, const string &filename, idx_t position, const void *buffer, idx_t max_nr_bytes) {
-	idx_t actual_bytes = 0, start_pos = position;
-	CacheEntry *cache_entry = nullptr;
-
-	if (!max_nr_bytes || !cache_initialized || static_cast<idx_t>(max_nr_bytes) > cache_capacity) {
+	if (!config.cache_initialized || !max_nr_bytes || static_cast<idx_t>(max_nr_bytes) > config.total_cache_capacity) {
 		return;
 	}
-	// Acquire both mutexes: global first, then entry-specific
-	std::unique_lock<std::mutex> lock(cache_mutex);
+	if (cache_type == CacheType::LARGE_RANGE) {
+		// do debug
+	}
 
-	auto cache_it = key_cache.find(cache_key);
-	if (cache_it == key_cache.end()) {
-		// Create new entry
-		auto new_entry = make_uniq<CacheEntry>();
-		new_entry->filename = filename;
-		cache_entry = new_entry.get();
-		key_cache[cache_key] = std::move(new_entry);
-		AddToLRUFront(cache_entry);
-	} else if (cache_it->second->filename == filename) {
-		cache_entry = cache_it->second.get();
-		TouchLRU(cache_entry);
-	} else {
+	std::unique_lock<std::mutex> lock(cache_mutex); // lock caches
+
+	auto cache_entry = cache.UpsertCacheEntry(cache_key, filename);
+	if (!cache_entry) {
 		return; // name collision (rare)
 	}
 
 	// Check if range already cached
-	auto hit_range = AnalyzeRange(cache_entry, start_pos, max_nr_bytes);
-	auto end_pos = start_pos + max_nr_bytes;
-	idx_t offset = 0;
+	auto hit_range = AnalyzeRange(cache_entry->ranges, position, max_nr_bytes);
+	idx_t offset = 0, actual_bytes = 0, start_pos = position, end_pos = start_pos + max_nr_bytes;
 	if (hit_range) { // another thread cached the same range in the meantime
 		offset = hit_range->end - start_pos;
 		start_pos = hit_range->end; // cache only from the end
@@ -103,43 +138,56 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 	if (end_pos > start_pos) {
 		actual_bytes = end_pos - start_pos;
 	}
-	if (actual_bytes == 0 || !EvictToCapacity(actual_bytes, cache_key)) {
-		return; // decide not to cache after all
+	if (actual_bytes == 0 || !EvictToCapacity(actual_bytes, filename)) {
+		return; // back off, do not cache this range
 	}
-	current_cache_size += actual_bytes;
-	current_cache_ranges++;
 
-	auto new_range = duckdb::make_shared_ptr<CacheRange>(start_pos, end_pos);
-	cache_entry->ranges[start_pos] = new_range;
+	// Create new range and update stats
+	auto new_range = make_uniq<CacheRange>(start_pos, end_pos);
+	CacheRange* range_ptr = new_range.get();  // Get pointer before moving
+	cache_entry->ranges[start_pos] = std::move(new_range);
 	cache_entry->cached_file_size += actual_bytes;
+	cache.current_size += actual_bytes;
+	cache.num_ranges++;
 
-	// Release global mutex - ranges_mutex still held for memcpy and job queue
-	lock.unlock();
+	// Generate cache filepath
+	string cache_filepath = config.GenCacheFilePath(cache_entry->entry_id, cache_key, cache_type);
 
-	// allocate and copy data into tmp_buffer outside lock (can be slowish)
-	auto mem_buffer = duckdb::make_shared_ptr<SharedBuffer>(actual_bytes);
-	std::memcpy(mem_buffer->data.get(), static_cast<const char*>(buffer) + offset, actual_bytes);
-	new_range->memory_buffer = mem_buffer; // lock-free assignment sequence: assign after copy
+	lock.unlock(); // Release global mutex
 
-	// Queue for writing to disk
-	QueueCacheWrite(cache_key, new_range);
+	// allocate and copy data into file_buffer outside lock (can be slowish)
+	auto file_buffer = duckdb::make_shared_ptr<CacheFileBuffer>(actual_bytes);
+	file_buffer->file_offset_ptr = &range_ptr->file_offset;  // Set backpointer for write completion
+	std::memcpy(file_buffer->data.get(), static_cast<const char*>(buffer) + offset, actual_bytes);
+	range_ptr->memory_buffer = file_buffer; // lock-free assignment sequence: assign after copy
+	string hex_prefix = cache_key.substr(4, 2); // the first 4 hex is the dir, take the next 2 for the partition
+	idx_t partition = std::stoul(hex_prefix, nullptr, 16)  % num_writer_threads;
+	QueueCacheWrite(cache_filepath, partition, file_buffer); 	// writing to disk is done by background threads
 }
-
 
 //===----------------------------------------------------------------------===//
 // Multi-threaded background cache writer implementation
 //===----------------------------------------------------------------------===//
 
+void BlobCache::QueueCacheWrite(const string &filepath, idx_t partition, duckdb::shared_ptr<CacheFileBuffer> buffer) {
+	// Use first 2 hex chars from filepath for partitioning
+	{
+		std::lock_guard<std::mutex> lock(write_queue_mutexes[partition]);
+		write_job_queues[partition].emplace(filepath, buffer);
+	}
+	write_queue_cvs[partition].notify_one();
+}
+
 void BlobCache::StartCacheWriterThreads(idx_t thread_count) {
 	if (thread_count > MAX_WRITER_THREADS) {
 		thread_count = MAX_WRITER_THREADS;
-		LogDebug(StringUtil::Format("Limiting writer threads to maximum allowed: %zu", MAX_WRITER_THREADS));
+		config.LogDebug("Limiting writer threads to maximum allowed: " + std::to_string(MAX_WRITER_THREADS));
 	}
 	shutdown_writer_threads = false;
 	num_writer_threads = thread_count;
-	
-	LogDebug(StringUtil::Format("Starting %zu cache writer threads", num_writer_threads));
-	
+
+	config.LogDebug("Starting " + std::to_string(num_writer_threads) + " cache writer threads");
+
 	for (idx_t i = 0; i < num_writer_threads; i++) {
 		cache_writer_threads[i] = std::thread([this, i] { CacheWriterThreadLoop(i); });
 	}
@@ -167,18 +215,18 @@ void BlobCache::StopCacheWriterThreads() {
 			}
 		}
 	}
-	// Only log if not shutting down to prevent database access issues
-	if (!database_shutting_down.load()) {
-		LogDebug(StringUtil::Format("Stopped %zu cache writer threads", num_writer_threads));
+	// Only log if not shutting down
+	if (!config.database_shutting_down) {
+		config.LogDebug("Stopped " + std::to_string(num_writer_threads) + " cache writer threads");
 	}
 	num_writer_threads = 0; // Reset thread count
 }
 
 void BlobCache::CacheWriterThreadLoop(idx_t thread_id) {
-	LogDebug(StringUtil::Format("Cache writer thread %zu started", thread_id));
-	
+	config.LogDebug("Cache writer thread " + std::to_string(thread_id) + " started");
+
 	while (!shutdown_writer_threads) {
-		pair<string, duckdb::shared_ptr<CacheRange>> job;
+		pair<string, duckdb::shared_ptr<CacheFileBuffer>> job;
 		bool has_job = false;
 		// Wait for a job or shutdown signal for this thread's queue
 		{
@@ -200,414 +248,208 @@ void BlobCache::CacheWriterThreadLoop(idx_t thread_id) {
 			continue;
 		}
 		// Process the cache write job
-		const string &cache_key = job.first;
-		auto range = job.second;
-		idx_t data_size = range->end - range->start;
-		if (WriteToCacheFile(cache_key, range->memory_buffer->data.get(), data_size, range->file_offset)) {
-			// Successfully wrote to cache file, mark the range as disk-complete
-			// No need to look up in cache - we modify the shared object directly
-			range->disk_write_complete = true;
-			LogDebug(StringUtil::Format("Background writer completed range [%lld, %lld) for cache_key '%s'",
-										   range->start, range->end, cache_key.c_str()));
+		const string &cache_filepath = job.first;
+		auto file_buffer = job.second;
 
-			// Check if we can merge with the previous range
-			//TryMergeWithPrevious(cache_key, range);
+		// Determine cache type from filename: /cachedir/1234/567890ABCDEFsID:FILE:PROT -> 's' means SMALL_RANGE
+		size_t last_sep = cache_filepath.find_last_of(config.path_sep);
+		char type_char = cache_filepath[last_sep + 12 + 1]; // after / there are 12 hex chars and then 's' or 'l'
+		CacheType cache_type = (type_char == 's') ? CacheType::SMALL_RANGE : CacheType::LARGE_RANGE;
+		CacheMap& cache = GetCacheMap(cache_type);
+
+		idx_t file_offset;
+		if (cache.WriteToCacheFile(cache_filepath, file_buffer->data.get(), file_buffer->size, file_offset)) {
+			// Successfully wrote to cache file, update the CacheRange::file_offset atomically via backpointer
+			file_buffer->file_offset_ptr->store(file_offset);
+			config.LogDebug("Background writer completed write for cache_filepath '" + cache_filepath + "'");
 		}
 	}
 	// Only log thread shutdown if not during database shutdown to avoid access to destroyed instance
-	if (!database_shutting_down.load()) {
-		LogDebug(StringUtil::Format("Cache writer thread %zu stopped", thread_id));
+	if (!config.database_shutting_down) {
+		config.LogDebug("Cache writer thread " + std::to_string(thread_id) + " stopped");
 	}
 }
 
-void BlobCache::QueueCacheWrite(const string &cache_key, duckdb::shared_ptr<CacheRange> range) {
-	idx_t partition = GetPartitionForKey(cache_key);
-	{
-		std::lock_guard<std::mutex> lock(write_queue_mutexes[partition]);
-		write_job_queues[partition].emplace(cache_key, range);
-	}
-	write_queue_cvs[partition].notify_one();
-}
+//===----------------------------------------------------------------------===//
+// CacheMap - eviction logic
+//===----------------------------------------------------------------------===//
 
-
-bool BlobCache::HasUnfinishedWrites(const string &cache_key) {
-	auto cache_it = key_cache.find(cache_key);
-	if (cache_it == key_cache.end()) return false;
-	for (const auto &range_pair : cache_it->second->ranges) {
-		if (range_pair.second->memory_buffer && !range_pair.second->disk_write_complete) {
-			return true;
-		}
-	}
-	return false;
-}
-
-// LRU List Management methods moved to inline implementations in blobcache.hpp
-bool BlobCache::EvictToCapacity(idx_t required_space, const string &exclude_key) {
+bool CacheMap::EvictToCapacity(idx_t required_space, CacheType cache_type, const string &exclude_filename) {
 	// Try to evict entries to make space, returns true if successful
 	// Skip entries with unfinished writes and the exclude_key
 	// Note: This is called with cache_mutex already held
-	idx_t attempts = 0;
-	const idx_t max_attempts = key_cache.empty() ? 0 : key_cache.size() * 2; // Prevent infinite loops
-
-	while (current_cache_size + required_space > cache_capacity && lru_tail && attempts < max_attempts) {
-		attempts++;
-		CacheEntry* entry_to_evict = lru_tail;
-
-		// Find the cache key for this entry
-		string cache_key_to_evict;
-		for (const auto& kv : key_cache) {
-			if (kv.second.get() == entry_to_evict) {
-				cache_key_to_evict = kv.first;
-				break;
-			}
-		}
-
-		if (cache_key_to_evict.empty()) {
-			LogDebug("Failed to find cache key for LRU entry");
-			break;
-		}
-
-		// Skip if this is the key we're trying to insert
-		if (!exclude_key.empty() && cache_key_to_evict == exclude_key) {
-			LogDebug(StringUtil::Format("Skipping eviction of current insert key '%s'", cache_key_to_evict.c_str()));
-			// Move it to front of LRU so we try something else
-			TouchLRU(entry_to_evict);
+	idx_t freed_space = 0;
+	CacheEntry *entry_to_evict = nullptr;
+	while (required_space > freed_space && lru_tail && lru_tail != entry_to_evict) {
+		entry_to_evict = lru_tail;
+		if (entry_to_evict->filename == exclude_filename) {
+			config.LogDebug("Skipping eviction of'" + exclude_filename + "'");
+			TouchLRU(entry_to_evict); // Move it to front of LRU so we try something else
 			continue;
 		}
-		// Skip if this entry has unfinished writes
-		if (HasUnfinishedWrites(cache_key_to_evict)) {
-			LogDebug(StringUtil::Format("Skipping eviction of key '%s' with unfinished writes", cache_key_to_evict.c_str()));
-			// Move it to front of LRU so we try something else
-			TouchLRU(entry_to_evict);
-			continue;
-		}
-		// Safe to evict this entry
-		string filename_to_evict = entry_to_evict->filename;
-		idx_t file_bytes = CalculateFileBytes(cache_key_to_evict);
-		LogDebug(StringUtil::Format("Evicting file '%s' (key=%s, size=%lld bytes) to make space",
-		                           filename_to_evict.c_str(), cache_key_to_evict.c_str(), file_bytes));
-		EvictKey(cache_key_to_evict);
+		freed_space += EvictCacheEntry(config.GenCacheKey(entry_to_evict->filename), cache_type);
 	}
-	if (current_cache_size + required_space > cache_capacity) {
-		LogDebug(StringUtil::Format("Cannot evict below %lld at size %lld to make room for %lld bytes",
-		                            current_cache_size, cache_capacity, required_space));
+	if (freed_space < required_space) {
+		config.LogError("Cannot evict below " + std::to_string(current_size) + " to make room for " + std::to_string(required_space) + " bytes");
 		return false;
 	}
 	return true;
 }
 
-void BlobCache::EvictFile(const string &filename) {
-	EvictKey(GenerateCacheKey(filename));
-}
-
-void BlobCache::EvictKey(const string &cache_key) {
-	idx_t file_bytes = CalculateFileBytes(cache_key);
-	auto cache_it = key_cache.find(cache_key);
-	if (cache_it != key_cache.end()) {
-		for(auto &range : cache_it->second->ranges) {
-			if (!range.second->disk_write_complete)	{
-				// Entry is currently in use, skip eviction
-				LogDebug(StringUtil::Format("Skipping eviction of key '%s' - entry is in use", cache_key.c_str()));
-				return;
-			}
-		}
-		// Safe to evict - ranges_mutex is locked so no other thread is using this entry
-		current_cache_size -= file_bytes;
-		current_cache_ranges -= cache_it->second->ranges.size();
-		RemoveFromLRU(cache_it->second.get());
-		key_cache.erase(cache_it);
+size_t CacheMap::EvictCacheEntry(const string &cache_key, CacheType cache_type) {
+	idx_t evicted_bytes = 0;
+	auto it = key_cache->find(cache_key);
+	if (it == key_cache->end()) {
+		config.LogError("Evictkey:  '" + cache_key + "' -not found");
+		return 0;
 	}
-	DeleteCacheFile(cache_key);
-}
-
-idx_t BlobCache::CalculateFileBytes(const string &cache_key) {
-	auto cache_it = key_cache.find(cache_key);
-	return cache_it == key_cache.end() ? 0 : cache_it->second->cached_file_size;
-}
-
-// Cache key generation methods moved to inline implementations in blobcache.hpp
-idx_t BlobCache::GetPartitionForKey(const string &cache_key) const {
-	string hex_prefix = cache_key.substr(0, 2);
-	idx_t partition_hash = std::stoul(hex_prefix, nullptr, 16);
-	return partition_hash % num_writer_threads;
-}
-
-
-//===----------------------------------------------------------------------===//
-// Disk cache helper methods
-//===----------------------------------------------------------------------===//
-void BlobCache::InitializeCache(const string &directory, idx_t max_size_bytes, idx_t writer_threads) {
-	std::lock_guard<std::mutex> lock(cache_mutex);
-	
-	if (cache_initialized) {
-		// Cache already initialized, check if we need to restart threads with different count
-		bool need_restart_threads = (num_writer_threads != writer_threads);
-		bool need_reinit_cache = (cache_dir_path != directory || cache_capacity != max_size_bytes);
-		
-		if (need_reinit_cache || need_restart_threads) {
-			LogDebug(StringUtil::Format("Reinitializing cache: old_dir='%s' new_dir='%s' old_size=%llu new_size=%llu old_threads=%zu new_threads=%zu", 
-			                           cache_dir_path.c_str(), directory.c_str(), cache_capacity, max_size_bytes, num_writer_threads, writer_threads));
-			
-			// Stop existing threads if we need to change thread count or directory
-			if (num_writer_threads > 0) {
-				LogDebug("Stopping existing cache writer threads for reinitialization");
-				StopCacheWriterThreads();
-			}
-			// Clear existing cache if directory/size changed
-			if (need_reinit_cache) {
-				ClearCache();
-			}
+	for(auto &range : it->second->ranges) {
+		evicted_bytes += range.second->end - range.second->start;
+		// Check if write is still in progress
+		if (range.second->file_offset.load() == CacheRange::WRITE_NOT_COMPLETED_YET) {
+			config.LogDebug("Skipping eviction of key '" + cache_key + "' - write in progress");
+			TouchLRU(it->second.get()); // remove it from the tail
+			return 0;
 		}
 	}
-	cache_dir_path = directory;
-	cache_capacity = max_size_bytes;
-	cache_initialized = true;
-
-	LogDebug(StringUtil::Format("Initializing cache: directory='%s' max_size=%llu bytes writer_threads=%zu",
-	                           cache_dir_path.c_str(), cache_capacity, writer_threads));
-	InitializeCacheDirectory();
-	StartCacheWriterThreads(writer_threads);
+	// evict - ranges_mutex is locked so no other thread is using this entry
+	RemoveFromLRU(it->second.get());
+	current_size -= std::min<idx_t>(current_size, evicted_bytes);
+	num_ranges -= std::min<idx_t>(num_ranges, it->second->ranges.size());
+	auto file_path = config.GenCacheFilePath(it->second->entry_id, cache_key, cache_type);
+	key_cache->erase(it);
+	return DeleteCacheFile(file_path) ? evicted_bytes : 0;
 }
 
-void BlobCache::ConfigureCache(const string &directory, idx_t max_size_bytes, idx_t writer_threads) {
-	std::lock_guard<std::mutex> lock(cache_mutex);
-	if (cache_initialized) {
-		// Cache already initialized, check what needs to be changed
-		bool need_restart_threads = (num_writer_threads != writer_threads);
-		bool directory_changed = (cache_dir_path != directory);
-		bool size_reduced = (max_size_bytes < cache_capacity);
-		bool size_changed = (cache_capacity != max_size_bytes);
-		
-		if (directory_changed || need_restart_threads || size_changed) {
-			LogDebug(StringUtil::Format("Configuring cache: old_dir='%s' new_dir='%s' old_size=%llu new_size=%llu old_threads=%zu new_threads=%zu", 
-			                           cache_dir_path.c_str(), directory.c_str(), cache_capacity, max_size_bytes, num_writer_threads, writer_threads));
-			
-			// Stop existing threads if we need to change thread count or directory
-			if (num_writer_threads > 0 && (need_restart_threads || directory_changed)) {
-				LogDebug("Stopping existing cache writer threads for reconfiguration");
-				StopCacheWriterThreads();
+void CacheMap::PurgeCacheForPatternChange(const vector<std::regex> &regexps, optional_ptr<FileOpener> opener, CacheType cache_type) {
+	// First pass: collect keys to evict (avoid iterator invalidation)
+	vector<string> keys_to_evict;
+
+	for (const auto &entry_pair : *key_cache) { // Check all entries in this cache
+		auto should_cache = false; // Check if this file should still be cached
+		if (regexps.empty()) {
+			// Conservative mode: only cache .parquet files when parquet_metadata_cache=true
+			if (opener && StringUtil::EndsWith(StringUtil::Lower(entry_pair.second->filename), ".parquet")) {
+				Value parquet_cache_value;
+				auto parquet_result = FileOpener::TryGetCurrentSetting(opener, "parquet_metadata_cache", parquet_cache_value);
+				should_cache =  (parquet_result && BooleanValue::Get(parquet_cache_value));
 			}
-			// Clear existing cache only if directory changed
-			if (directory_changed) {
-				LogDebug("Directory changed, clearing cache");
-				ClearCache();
-				CleanCacheDirectory(); // Clean old directory before switching
-				cache_dir_path = directory;
-				// Check if this is the special debug directory
-				InitializeCacheDirectory();
-			} else {
-				// Same directory, just update capacity and evict if needed
-				cache_capacity = max_size_bytes;
-				if (size_reduced && current_cache_size > cache_capacity) {
-					LogDebug(StringUtil::Format("Cache size reduced from %llu to %llu bytes, evicting excess entries", 
-					                           current_cache_size, cache_capacity));
-					EvictToCapacity(0); // Evict until we're under the new capacity
+		} else { // Aggressive mode: use regex patterns
+			for (const auto &pattern : regexps) {
+				if (std::regex_search(entry_pair.second->filename, pattern)) {
+					should_cache = true;
+					break;
 				}
 			}
-			// Start threads if they were stopped or thread count changed
-			if (need_restart_threads || directory_changed) {
-				StartCacheWriterThreads(writer_threads);
-			}
-		} else {
-			LogDebug("Cache configuration unchanged, no action needed");
 		}
-	} else {
-		// Cache not initialized yet, delegate to InitializeCache
-		LogDebug("Cache not initialized, delegating to InitializeCache");
-		// Release lock before calling InitializeCache to avoid deadlock
-		cache_mutex.unlock();
-		InitializeCache(directory, max_size_bytes, writer_threads);
-		return; // InitializeCache handles everything
+		if (!should_cache) {
+			keys_to_evict.push_back(entry_pair.first);
+		}
 	}
-	LogDebug(StringUtil::Format("Cache configuration complete: directory='%s' max_size=%llu bytes writer_threads=%zu", 
-	                           cache_dir_path.c_str(), cache_capacity, writer_threads));
+
+	// Second pass: evict collected keys (safe, no iterator invalidation)
+	for (const auto &key : keys_to_evict) {
+		EvictCacheEntry(key, cache_type);
+	}
 }
 
-vector<BlobCache::RangeInfo> BlobCache::GetCacheStatistics() const {
-	std::lock_guard<std::mutex> lock(cache_mutex);
-	vector<RangeInfo> range_infos;
-	if (!cache_initialized) {
-		return range_infos;
-	}
-	range_infos.reserve(current_cache_ranges);
-
-	// Collect cache entries in LRU order (least recently used first)
+vector<CacheRangeInfo> CacheMap::GetStatistics() const { // produce list of cached ranges for blobcache_stats() TF
+	vector<CacheRangeInfo> result;
+	result.reserve(num_ranges);
 	CacheEntry* current = lru_tail;
 	while (current) {
-		RangeInfo info;
+		CacheRangeInfo info;
 		info.protocol = "unknown";
 		info.filename = current->filename;
-		auto pos = info.filename.find_first_of("://");
-		if (pos < info.filename.length()) {
+		auto pos = info.filename.find("://");
+		if (pos != string::npos) {
 			info.protocol = info.filename.substr(0, pos);
-			info.filename = info.filename.substr(pos + 3,info.filename.length() - (pos + 3));
+			info.filename = info.filename.substr(pos + 3, info.filename.length() - (pos + 3));
 		}
 		for (const auto &range_pair : current->ranges) {
-			info.file_offset = range_pair.second->file_offset;
+			info.file_offset = range_pair.second->file_offset.load(std::memory_order_acquire);
 			info.start = range_pair.second->start;
 			info.end = range_pair.second->end;
 			info.usage_count = range_pair.second->usage_count;
 			info.bytes_from_cache = range_pair.second->bytes_from_cache;
-			range_infos.push_back(info);
+			result.push_back(info);
 		}
-		current = current->lru_prev; // Move to next entry in LRU order
+		current = current->lru_prev;
 	}
-	return range_infos;
+	return result;
 }
 
-void BlobCache::InitializeCacheDirectory() {
-	// Create cache directory if it doesn't exist, or clean it if it does
-	struct stat st;
-	if (stat(cache_dir_path.c_str(), &st) == 0) {
-		// Directory exists, clean it to ensure it's empty
-		LogDebug(StringUtil::Format("Cache directory '%s' exists, cleaning it", cache_dir_path.c_str()));
-		CleanCacheDirectory();
-	} else {
-		// Create directory with proper error handling
-		if (mkdir(cache_dir_path.c_str(), 0755) != 0) {
-			if (errno == EEXIST) {
-				// Directory was created by another process, clean it to be safe
-				LogDebug(StringUtil::Format("Cache directory '%s' was created concurrently, cleaning it",
-				                            cache_dir_path.c_str()));
-				CleanCacheDirectory();
-			} else {
-				LogError(StringUtil::Format("Failed to create cache directory '%s': %s", cache_dir_path.c_str(),
-				                            strerror(errno)));
-				return; // Don't continue if we can't create the directory
-			}
-		} else {
-			LogDebug(StringUtil::Format("Created cache directory '%s'", cache_dir_path.c_str()));
-		}
-	}
-	ClearCache();
-}
+//===----------------------------------------------------------------------===//
+// CacheMap file management
+//===----------------------------------------------------------------------===//
 
-void BlobCache::CleanCacheDirectory() {
-	DIR *dir = opendir(cache_dir_path.c_str());
-	if (!dir) {
-		LogError(StringUtil::Format("Failed to open cache directory '%s' for cleaning: %s", 
-		                           cache_dir_path.c_str(), strerror(errno)));
-		return;
+void CacheMap::EnsureSubdirectoryExists(const string &cache_filepath) {
+	// Extract subdirectory from cache_filepath
+	// Format: /cachedir/1234/s567890 -> need to ensure /cachedir/1234/ exists
+	size_t last_sep = cache_filepath.find_last_of("/\\");
+	if (last_sep == string::npos) {
+		return; // No subdirectory
 	}
-	struct dirent *entry;
-	while ((entry = readdir(dir)) != nullptr) {
-		// Skip . and ..
-		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-			continue;
-		}
-		string subdir_path = cache_dir_path + path_separator + entry->d_name;
-		
-		// Remove all files in subdirectory
-		DIR *subdir = opendir(subdir_path.c_str());
-		if (subdir) {
-			struct dirent *subentry;
-			while ((subentry = readdir(subdir)) != nullptr) {
-				if (strcmp(subentry->d_name, ".") == 0 || strcmp(subentry->d_name, "..") == 0) {
-					continue;
-				}
-				string file_path = subdir_path + path_separator + subentry->d_name;
-				if (unlink(file_path.c_str()) != 0) {
-					LogError(StringUtil::Format("Failed to remove cache file '%s': %s", 
-					                           file_path.c_str(), strerror(errno)));
-				}
-			}
-			closedir(subdir);
-		}
-		// Remove subdirectory
-		if (rmdir(subdir_path.c_str()) != 0) {
-			LogError(StringUtil::Format("Failed to remove cache subdirectory '%s': %s", 
-			                           subdir_path.c_str(), strerror(errno)));
-		}
-	}
-	closedir(dir);
-	LogDebug(StringUtil::Format("Cleaned cache directory '%s'", cache_dir_path.c_str()));
-}
+	string subdir_path = cache_filepath.substr(0, last_sep);
 
-string BlobCache::GetCacheFilePath(const string &cache_key) {
-	string subdir_name = cache_key.substr(0, 4);
-	string file_name = cache_key.substr(4);  // Remove first 4 characters for filename
-	return cache_dir_path + path_separator + subdir_name + path_separator + file_name;
-}
+	// Extract just the subdir name for hashing (e.g., "1234")
+	size_t prev_sep = subdir_path.find_last_of(config.path_sep);
+	string subdir_name = (prev_sep != string::npos) ? subdir_path.substr(prev_sep + 1) : subdir_path;
 
-void BlobCache::EnsureSubdirectoryExists(const string &cache_key) {
-	string subdir_name = cache_key.substr(0, 4);
-	uint16_t subdir_index = 0;
-	for (int i = 0; i < 4; i++) {
-		char c = subdir_name[i];
-		uint16_t digit = 0;
-		if (c >= '0' && c <= '9') {
-			digit = c - '0';
-		} else if (c >= 'A' && c <= 'F') {
-			digit = c - 'A' + 10;
-		}
-		subdir_index = (subdir_index << 4) | digit;
-	}
-	if (subdirs_created[subdir_index]) {
+	uint16_t subdir_index = std::hash<string>{}(subdir_name) % config.subdirs_created.size();
+	if (config.subdirs_created[subdir_index]) {
 		return;  // Already exists
 	}
-	// Create subdirectory
-	string subdir_path = cache_dir_path + path_separator + subdir_name;
 	if (mkdir(subdir_path.c_str(), 0755) == 0) {
-		subdirs_created[subdir_index] = true;
-		LogDebug(StringUtil::Format("Created cache subdirectory '%s'", subdir_path.c_str()));
+		config.LogDebug("Created cache subdirectory '" + subdir_path + "'");
+		config.subdirs_created[subdir_index] = true;
 	} else if (errno == EEXIST) {
-		// Directory already exists, mark as created
-		subdirs_created[subdir_index] = true;
+		config.subdirs_created[subdir_index] = true;
 	} else {
-		LogError(StringUtil::Format("Failed to create cache subdirectory '%s': %s", 
-		                           subdir_path.c_str(), strerror(errno)));
+		config.LogError("Failed to create cache subdirectory '" + subdir_path + "': " + string(strerror(errno)));
 	}
 }
 
-int BlobCache::OpenCacheFile(const string &cache_key, int flags) {
-	EnsureSubdirectoryExists(cache_key);
-	string file_path = GetCacheFilePath(cache_key);
-	if (file_path.empty()) {
-		return -1;
-	}
-	int fd = open(file_path.c_str(), flags, 0644);
+int CacheMap::OpenCacheFile(const string &cache_filepath, int flags) {
+	EnsureSubdirectoryExists(cache_filepath);
+	int fd = open(cache_filepath.c_str(), flags, 0644);
 	if (fd == -1) {
-		LogError(StringUtil::Format("Failed to open cache file '%s': %s",
-		                           file_path.c_str(), strerror(errno)));
+		config.LogError("Failed to open cache file '" + cache_filepath + "': " + string(strerror(errno)));
 	}
 	return fd;
 }
 
-bool BlobCache::ReadFromCacheFile(const string &cache_key, idx_t file_offset, void *buffer, idx_t length) {
+bool CacheMap::ReadFromCacheFile(const string &cache_filepath, idx_t file_offset, void *buffer, idx_t length) {
 	int flags = O_RDONLY;
-	int fd = OpenCacheFile(cache_key, flags);
+	int fd = OpenCacheFile(cache_filepath, flags);
 	if (fd == -1) {
 		return false;
 	}
 	if (lseek(fd, file_offset, SEEK_SET) == -1) {
-		LogError(StringUtil::Format("Failed to seek in cache file '%s' to offset %zu: %s",
-		                           cache_key.c_str(), file_offset, strerror(errno)));
+		config.LogError("Failed to seek in cache file '" + cache_filepath + "' to offset " + std::to_string(file_offset) + ": " + string(strerror(errno)));
 		close(fd);
 		return false;
 	}
 	ssize_t bytes_read = read(fd, buffer, length);
 	close(fd);
 	if (bytes_read != static_cast<ssize_t>(length)) {
-		LogError(StringUtil::Format("Failed to read %zu bytes from cache file '%s' (read %zd): %s",
-		                           length, cache_key.c_str(), bytes_read, strerror(errno)));
+		config.LogError("Failed to read " + std::to_string(length) + " bytes from cache file '" + cache_filepath + "' (read " + std::to_string(bytes_read) + "): " + string(strerror(errno)));
 		return false;
 	}
-
 	return true;
 }
 
-bool BlobCache::WriteToCacheFile(const string &cache_key, const void *buffer, idx_t length, idx_t &file_offset) {
+bool CacheMap::WriteToCacheFile(const string &cache_filepath, const void *buffer, idx_t length, idx_t &file_offset) {
 	// Open file for append to get current end position
 	int flags = O_WRONLY | O_CREAT | O_APPEND;
-	int fd = OpenCacheFile(cache_key, flags);
+	int fd = OpenCacheFile(cache_filepath, flags);
 	if (fd == -1) {
 		return false;
 	}
 	// Get current position (which is end of file due to O_APPEND)
 	file_offset = lseek(fd, 0, SEEK_CUR);
 	if (file_offset == (idx_t)-1) {
-		LogError(StringUtil::Format("Failed to get file position for cache file '%s': %s",
-		                           cache_key.c_str(), strerror(errno)));
+		config.LogError("Failed to get file position for cache file '" + cache_filepath + "': " + string(strerror(errno)));
 		close(fd);
 		return false;
 	}
@@ -619,180 +461,212 @@ bool BlobCache::WriteToCacheFile(const string &cache_key, const void *buffer, id
 	ssize_t bytes_written = write(fd, buffer, length);
 	close(fd);
 	if (bytes_written != static_cast<ssize_t>(length)) {
-		LogError(StringUtil::Format("Failed to write %zu bytes to cache file '%s' (wrote %zd): %s",
-		                           length, cache_key.c_str(), bytes_written, strerror(errno)));
+		config.LogError("Failed to write " + std::to_string(length) + " bytes to cache file '" + cache_filepath + "' (wrote " + std::to_string(bytes_written) + "): " + string(strerror(errno)));
 		return false;
 	}
 
 	return true;
 }
 
-void BlobCache::DeleteCacheFile(const string &cache_key) {
-	string file_path = GetCacheFilePath(cache_key);
-	if (file_path.empty()) {
-		return;
+bool CacheMap::DeleteCacheFile(const string &cache_filepath) {
+	if (unlink(cache_filepath.c_str()) != 0) {
+		config.LogError("Failed to delete cache file '" + cache_filepath + "': " + string(strerror(errno)));
+		return false;
 	}
-	if (unlink(file_path.c_str()) != 0) {
-		LogError(StringUtil::Format("Failed to delete cache file '%s': %s", 
-		                           file_path.c_str(), strerror(errno)));
+	config.LogDebug("Deleted cache file '" + cache_filepath + "'");
+	return true;
+}
+
+//===----------------------------------------------------------------------===//
+// CacheMap LRU management methods
+//===----------------------------------------------------------------------===//
+void CacheMap::TouchLRU(CacheEntry* entry) {
+	// Move entry to front of LRU list (most recently used)
+	// Note: Must be called with cache_mutex held
+	if (entry == lru_head) {
+		return; // Already at front
+	}
+	RemoveFromLRU(entry); // Remove from current position
+	AddToLRUFront(entry); // Add to front
+}
+
+void CacheMap::RemoveFromLRU(CacheEntry* entry) {
+	// Remove entry from LRU list
+	// Note: Must be called with cache_mutex held
+	if (entry->lru_prev) {
+		entry->lru_prev->lru_next = entry->lru_next;
 	} else {
-		LogDebug(StringUtil::Format("Deleted cache file '%s'", file_path.c_str()));
+		lru_head = entry->lru_next;
+	}
+	if (entry->lru_next) {
+		entry->lru_next->lru_prev = entry->lru_prev;
+	} else {
+		lru_tail = entry->lru_prev;
+	}
+	entry->lru_prev = nullptr;
+	entry->lru_next = nullptr;
+}
+
+void CacheMap::AddToLRUFront(CacheEntry* entry) {
+	// Add entry to front of LRU list (most recently used)
+	// Note: Must be called with cache_mutex held
+	entry->lru_prev = nullptr;
+	entry->lru_next = lru_head;
+	if (lru_head) {
+		lru_head->lru_prev = entry;
+	}
+	lru_head = entry;
+	if (!lru_tail) {
+		lru_tail = entry;
 	}
 }
 
 //===----------------------------------------------------------------------===//
-// Configuration and caching policy implementation
+// BlobCache eviction from both (small,large) range caches
+//===----------------------------------------------------------------------===//
+
+bool BlobCache::EvictToCapacity(idx_t extra_bytes, const string &exclude_filename) {
+	// note: mutex should already be held
+	// Evict from large cache first (since it gets 90% capacity)
+	idx_t large_capacity = GetCacheCapacity(CacheType::LARGE_RANGE);
+	auto result = true;
+	if (large_cache->current_size + extra_bytes > large_capacity) {
+		if (!large_cache->EvictToCapacity(large_cache->current_size + extra_bytes - large_capacity, CacheType::LARGE_RANGE, exclude_filename)) {
+			result = false;
+		} else {
+			extra_bytes = 0;
+		}
+	}
+	// Then evict from small cache if needed
+	idx_t small_capacity = GetCacheCapacity(CacheType::SMALL_RANGE);
+	if (small_cache->current_size + extra_bytes > small_capacity) {
+		result &=
+		    small_cache->EvictToCapacity(small_cache->current_size + extra_bytes - small_capacity, CacheType::SMALL_RANGE, exclude_filename);
+	}
+	return result;
+}
+
+//===----------------------------------------------------------------------===//
+// BlobCache (re-) configuration
+//===----------------------------------------------------------------------===//
+
+void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx_t writer_threads, idx_t small_threshold) {
+	std::lock_guard<std::mutex> lock(cache_mutex);
+	auto directory = base_dir + (StringUtil::EndsWith(base_dir, config.path_sep) ? "" : config.path_sep);
+	if (!config.cache_initialized) {
+		// Release lock before calling InitializeCache to avoid deadlock
+		config.cache_dir = directory;
+		config.total_cache_capacity = max_size_bytes;
+		config.small_range_threshold = small_threshold;
+
+		config.LogDebug("Initializing cache: directory='" + config.cache_dir + "' max_size=" + std::to_string(config.total_cache_capacity) + " bytes writer_threads=" + std::to_string(writer_threads) + " small_threshold=" + std::to_string(config.small_range_threshold));
+		if (!config.InitCacheDir()) {
+			config.LogError("Initializing cache directory='" + config.cache_dir + "' failed");
+		}
+		ClearCache();
+		config.cache_initialized = true;
+		StartCacheWriterThreads(writer_threads);
+		return;
+	}
+
+	// Cache already initialized, check what needs to be changed
+	bool need_restart_threads = (num_writer_threads != writer_threads);
+	bool directory_changed = (config.cache_dir != directory);
+	bool size_reduced = (max_size_bytes < config.total_cache_capacity);
+	bool size_changed = (config.total_cache_capacity != max_size_bytes);
+	bool threshold_changed = (config.small_range_threshold != small_threshold);
+	if (!directory_changed && !need_restart_threads && !size_changed && !threshold_changed) {
+		config.LogDebug("Cache configuration unchanged, no action needed");
+		return;
+	}
+
+	// Stop existing threads if we need to change thread count or directory
+	config.LogDebug("Configuring cache: old_dir='" + config.cache_dir + "' new_dir='" + directory + "' old_size=" + std::to_string(config.total_cache_capacity) + " new_size=" + std::to_string(max_size_bytes) + " old_threads=" + std::to_string(num_writer_threads) + " new_threads=" + std::to_string(writer_threads) + " old_threshold=" + std::to_string(config.small_range_threshold) + " new_threshold=" + std::to_string(small_threshold));
+	if (num_writer_threads > 0 && (need_restart_threads || directory_changed)) {
+		config.LogDebug("Stopping existing cache writer threads for reconfiguration");
+		StopCacheWriterThreads();
+	}
+
+	// Clear existing cache only if directory changed or threshold changed (entries may be in wrong cache)
+	if (directory_changed || threshold_changed) {
+		config.LogDebug("Directory or threshold changed, clearing cache");
+		ClearCache();
+		if (directory_changed) {
+			if (!config.CleanCacheDir()) { // Clean old directory before switching
+				config.LogError("Cleaning cache directory='" + config.cache_dir + "' failed");
+			}
+		}
+		config.cache_dir = directory;
+		config.small_range_threshold = small_threshold;
+		if (!config.InitCacheDir()) {
+			config.LogError("Initializing cache directory='" + config.cache_dir + "' failed");
+		}
+	}
+	// Same directory, just update capacity and evict if needed
+	config.total_cache_capacity = max_size_bytes;
+	if (size_reduced && !EvictToCapacity()) {
+		config.LogError("Failed to reduce the directory sizes to the new lower capacity/");
+	}
+	// Start threads if they were stopped or thread count changed
+	if (need_restart_threads || directory_changed) {
+		StartCacheWriterThreads(writer_threads);
+	}
+	config.LogDebug("Cache configuration complete: directory='" + config.cache_dir + "' max_size=" + std::to_string(config.total_cache_capacity) + " bytes writer_threads=" + std::to_string(writer_threads) + " small_threshold=" + std::to_string(config.small_range_threshold));
+}
+
+//===----------------------------------------------------------------------===//
+// caching policy based on regexps
 //===----------------------------------------------------------------------===//
 
 void BlobCache::UpdateRegexPatterns(const string &regex_patterns_str) {
 	std::lock_guard<std::mutex> lock(regex_mutex);
-	
+
 	cached_regexps.clear(); // Clear existing patterns
-	
+
 	if (regex_patterns_str.empty()) {
 		// Conservative mode: empty regexps
-		conservative_mode = true;
-		LogDebug("Updated to conservative mode (empty regex patterns)");
+		config.LogDebug("Updated to conservative mode (empty regex patterns)");
 		return;
 	}
 	// Aggressive mode: parse semicolon-separated patterns
-	conservative_mode = false;
 	vector<string> pattern_strings = StringUtil::Split(regex_patterns_str, ';');
-	
+
 	for (const auto &pattern_str : pattern_strings) {
 		if (!pattern_str.empty()) {
 			try {
 				cached_regexps.emplace_back(pattern_str, std::regex_constants::icase);
-				LogDebug(StringUtil::Format("Compiled regex pattern: '%s'", pattern_str.c_str()));
+				config.LogDebug("Compiled regex pattern: '" + pattern_str + "'");
 			} catch (const std::regex_error &e) {
-				LogError(StringUtil::Format("Invalid regex pattern '%s': %s", pattern_str.c_str(), e.what()));
+				config.LogError("Invalid regex pattern '" + pattern_str + "': " + string(e.what()));
 			}
 		}
 	}
-	LogDebug(StringUtil::Format("Updated to aggressive mode with %zu regex patterns", cached_regexps.size()));
-}
-
-void BlobCache::PurgeCacheForPatternChange(optional_ptr<FileOpener> opener) {
-	std::lock_guard<std::mutex> cache_lock(cache_mutex);
-	
-	if (!cache_initialized) {
-		return;
-	}
-	LogDebug("Purging cache entries that no longer match current caching patterns");
-	vector<string> keys_to_evict;
-	
-	// Go through all cached entries and check if they should still be cached
-	for (const auto &entry_pair : key_cache) {
-		const string &cache_key = entry_pair.first;
-		
-		// Extract filename from cache_key (format: "filename:filesystem")
-		size_t colon_pos = cache_key.find_last_of(':');
-		if (colon_pos == string::npos) {
-			continue; // Invalid key format
-		}
-		
-		string filename = cache_key.substr(0, colon_pos);
-		
-		// Check if this file should still be cached using current patterns
-		bool should_cache = false;
-		{
-			std::lock_guard<std::mutex> regex_lock(regex_mutex);
-			if (conservative_mode) {
-				// Conservative mode: only cache .parquet files when parquet_metadata_cache=true
-				if (StringUtil::EndsWith(StringUtil::Lower(filename), ".parquet")) {
-					// Check parquet_metadata_cache setting if opener is available
-					if (opener) {
-						Value parquet_cache_value;
-						auto parquet_result = FileOpener::TryGetCurrentSetting(opener, "parquet_metadata_cache", parquet_cache_value);
-						if (parquet_result) {
-							should_cache = BooleanValue::Get(parquet_cache_value);
-						} else {
-							should_cache = true; // Default to true for parquet files
-						}
-					} else {
-						should_cache = true; // Default to true for parquet files
-					}
-				}
-			} else {
-				// Aggressive mode: use cached compiled regex patterns
-				for (const auto &compiled_pattern : cached_regexps) {
-					if (std::regex_search(filename, compiled_pattern)) {
-						should_cache = true;
-						break;
-					}
-				}
-			}
-		}
-		if (!should_cache) {
-			keys_to_evict.push_back(cache_key);
-		}
-	}
-	// Evict all non-qualifying entries
-	idx_t evicted_count = 0;
-	for (const auto &cache_key : keys_to_evict) {
-		EvictKey(cache_key);
-		evicted_count++;
-	}
-	LogDebug(StringUtil::Format("Purged %zu cache entries that no longer match caching patterns", evicted_count));
+	config.LogDebug("Updated to aggressive mode with " + std::to_string(cached_regexps.size()) + " regex patterns");
 }
 
 bool BlobCache::ShouldCacheFile(const string &filename, optional_ptr<FileOpener> opener) const {
 	std::lock_guard<std::mutex> lock(regex_mutex);
-
-	// Never cache file:// URLs as they are already local
 	if (StringUtil::StartsWith(StringUtil::Lower(filename), "file://")) {
-		return false;
+		return false; // Never cache file:// URLs as they are already local
 	}
-
-	// Always cache debug:// URLs for testing
 	if (StringUtil::StartsWith(StringUtil::Lower(filename), "debug://")) {
-		return true;
+		return true; // Always cache debug:// URLs for testing
 	}
-
-	if (conservative_mode) {
-		// Conservative mode: only cache .parquet files when parquet_metadata_cache=true
-		if (StringUtil::EndsWith(StringUtil::Lower(filename), ".parquet") && opener) {
-			Value parquet_cache_value;
-			auto parquet_result = FileOpener::TryGetCurrentSetting(opener, "parquet_metadata_cache", parquet_cache_value);
-			if (parquet_result) {
-				return BooleanValue::Get(parquet_cache_value);
-			}
-		}
-		return false;
-	} else {
+	if (!cached_regexps.empty()) {
 		// Aggressive mode: use cached compiled regex patterns
 		for (const auto &compiled_pattern : cached_regexps) {
 			if (std::regex_search(filename, compiled_pattern)) {
 				return true;
 			}
 		}
-		return false;
-	}
-}
-
-string BlobCache::GenerateCacheKey(const string &filename) {
-	hash_t hash_value = Hash(string_t(filename.c_str(), static_cast<uint32_t>(filename.length())));
-	std::stringstream hex_stream;
-	hex_stream << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << hash_value;
-	string hex_hash = hex_stream.str();
-	string suffix = ExtractValidSuffix(filename, 15);
-	string filename_lower = StringUtil::Lower(filename);
-	size_t protocol_end = filename_lower.find("://");
-	string protocol_suffix = (protocol_end != string::npos && protocol_end > 0) ?
-		":" + filename_lower.substr(0, protocol_end) : "";
-	return hex_hash + ":" + suffix + protocol_suffix;
-}
-
-string BlobCache::ExtractValidSuffix(const string &filename, size_t max_chars) {
-	string result;
-	result.reserve(max_chars);
-	for (size_t i = filename.length(); i > 0 && result.length() < max_chars; i--) {
-		char c = filename[i - 1];
-		if (std::isalnum(c) || c == '-' || c == '_' || c == '.') {
-			result = c + result;
+	} else if (StringUtil::EndsWith(StringUtil::Lower(filename), ".parquet") && opener) {
+		Value parquet_cache_value; // Conservative mode: only cache .parquet files if parquet_metadata_cache=true
+		auto parquet_result = FileOpener::TryGetCurrentSetting(opener, "parquet_metadata_cache", parquet_cache_value);
+		if (parquet_result) {
+			return BooleanValue::Get(parquet_cache_value);
 		}
 	}
-	return result;
+	return false;
 }
 
 } // namespace duckdb

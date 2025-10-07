@@ -17,10 +17,10 @@ unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileO
                                                         optional_ptr<FileOpener> opener) {
 	auto wrapped_handle = wrapped_fs->OpenFile(path, flags, opener);
 
-	if (cache->IsCacheInitialized() && flags.OpenForReading() && !flags.OpenForWriting()) {
+	if (cache->config.cache_initialized && flags.OpenForReading() && !flags.OpenForWriting()) {
 		if (cache->ShouldCacheFile(path, opener)) {
-			string cache_key = cache->GenerateCacheKey(path);
-			return make_uniq<BlobFileHandle>(*this, std::move(wrapped_handle), cache_key, cache);
+			string cache_key = cache->config.GenCacheKey(path);
+			return make_uniq<BlobFileHandle>(*this, path, std::move(wrapped_handle), cache_key, cache);
 		}
 	}
 	return wrapped_handle;
@@ -28,7 +28,8 @@ unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileO
 
 static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_handle, char* buffer, idx_t location, idx_t max_nr_bytes) {
 	// NOTE: ReadFromCache() can return cached_bytes == 0 but adjust max_nr_bytes downwards to align with a cached range
-	idx_t nr_bytes = blob_handle.cache->ReadFromCache(blob_handle.cache_key, location, buffer, max_nr_bytes);
+	idx_t nr_bytes = blob_handle.cache->ReadFromCache(blob_handle.cache_key, blob_handle.original_path,
+	                                                  location, buffer, max_nr_bytes);
 #if 0
     if (nr_bytes > 0) { // debug
 		char *tmp_buffer = new char[nr_bytes];
@@ -47,7 +48,7 @@ static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_hand
 		idx_t nr_read = max_nr_bytes - nr_bytes;
 		wrapped_fs.Seek(*blob_handle.wrapped_handle, location);
 		nr_read = wrapped_fs.Read(*blob_handle.wrapped_handle, buffer, nr_read);
-		blob_handle.cache->InsertCache(blob_handle.cache_key, blob_handle.wrapped_handle->GetPath(), location, buffer, nr_read);
+		blob_handle.cache->InsertCache(blob_handle.cache_key, blob_handle.original_path, location, buffer, nr_read);
 		if (nr_read && blob_handle.cache_key.substr(blob_handle.cache_key.find_last_of(':')) == ":debug") {
 			// inspired on AnyBlob paper: lowest latency is 20ms, transfer 12MB/s for the first MB, 40MB/s beyond that
 			uint64_t ms = (nr_read < (1<<20)) ? (20 + ((80*nr_read)>>20)) : (75 + ((25*nr_read) >> 20));
@@ -63,7 +64,7 @@ static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_hand
 
 void BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
-	if (!blob_handle.cache || !cache->IsCacheInitialized()) {
+	if (!blob_handle.cache || !cache->config.cache_initialized) {
 		wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes, location);
 		return; // a read that cannot cache
 	}
@@ -80,7 +81,7 @@ void BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_by
 
 int64_t BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
-	if (!blob_handle.cache || !cache->IsCacheInitialized()) {
+	if (!blob_handle.cache || !cache->config.cache_initialized) {
 		return wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes);
 	}
 	return ReadChunk(*wrapped_fs, blob_handle, static_cast<char*>(buffer), blob_handle.file_position, nr_bytes);
@@ -89,7 +90,7 @@ int64_t BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr
 void BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
 	if (blob_handle.cache) {
-		blob_handle.cache->InvalidateCache(blob_handle.cache_key);
+		blob_handle.cache->EvictFile(blob_handle.cache_key);
 	}
 	wrapped_fs->Write(*blob_handle.wrapped_handle, buffer, nr_bytes, location);
 	// Update position after write at explicit location
@@ -99,7 +100,7 @@ void BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t nr_b
 int64_t BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
 	if (blob_handle.cache) {
-		blob_handle.cache->InvalidateCache(blob_handle.cache_key);
+		blob_handle.cache->EvictFile(blob_handle.cache_key);
 	}
 	int64_t bytes_written = wrapped_fs->Write(*blob_handle.wrapped_handle, buffer, nr_bytes);
 	if (bytes_written > 0) {
@@ -111,22 +112,22 @@ int64_t BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t n
 void BlobFilesystemWrapper::Truncate(FileHandle &handle, int64_t new_size) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
 	if (blob_handle.cache) {
-		blob_handle.cache->InvalidateCache(blob_handle.cache_key);
+		blob_handle.cache->EvictFile(blob_handle.cache_key);
 	}
 	wrapped_fs->Truncate(*blob_handle.wrapped_handle, new_size);
 }
 
 void BlobFilesystemWrapper::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
 	if (cache) {
-		cache->InvalidateCache(cache->GenerateCacheKey(source));
-		cache->InvalidateCache(cache->GenerateCacheKey(target));
+		cache->EvictFile(source);
+		cache->EvictFile(target);
 	}
 	wrapped_fs->MoveFile(source, target, opener);
 }
 
 void BlobFilesystemWrapper::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
 	if (cache) {
-		cache->InvalidateCache(cache->GenerateCacheKey(filename));
+		cache->EvictFile(filename);
 	}
 	wrapped_fs->RemoveFile(filename, opener);
 }
@@ -173,7 +174,7 @@ void WrapExistingFilesystems(DatabaseInstance &instance) {
 
 	// Get the shared cache instance - only proceed if cache is initialized
 	auto shared_cache = GetOrCreateBlobCache(instance);
-	if (!shared_cache->IsCacheInitialized()) {
+	if (!shared_cache->config.cache_initialized) {
 		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Cache not initialized yet, skipping filesystem wrapping");
 		return;
 	}
