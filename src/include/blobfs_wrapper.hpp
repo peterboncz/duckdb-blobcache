@@ -23,7 +23,8 @@ class BlobCacheEntry : public ObjectCacheEntry {
 public:
 	shared_ptr<BlobCache> cache;
 
-	explicit BlobCacheEntry(shared_ptr<BlobCache> cache_p) : cache(std::move(cache_p)) {}
+	explicit BlobCacheEntry(shared_ptr<BlobCache> cache_p) : cache(std::move(cache_p)) {
+	}
 
 	string GetObjectType() override {
 		return "BlobCache";
@@ -45,8 +46,8 @@ public:
 	BlobFileHandle(FileSystem &fs, string original_path, unique_ptr<FileHandle> wrapped_handle, string cache_key,
 	               shared_ptr<BlobCache> cache)
 	    : FileHandle(fs, wrapped_handle->GetPath(), wrapped_handle->GetFlags()),
-	      wrapped_handle(std::move(wrapped_handle)), cache_key(std::move(cache_key)),
-	      cache(cache), original_path(std::move(original_path)), file_position(0) {
+	      wrapped_handle(std::move(wrapped_handle)), cache_key(std::move(cache_key)), cache(cache),
+	      original_path(std::move(original_path)), file_position(0) {
 	}
 
 	~BlobFileHandle() override = default;
@@ -61,7 +62,7 @@ public:
 	unique_ptr<FileHandle> wrapped_handle;
 	string cache_key;
 	shared_ptr<BlobCache> cache;
-	string original_path;  // Store original path with protocol prefix
+	string original_path; // Store original path with protocol prefix
 	idx_t file_position;  // Track our own file position
 };
 
@@ -209,7 +210,8 @@ public:
 	bool SubSystemIsDisabled(const string &name) override {
 		return wrapped_fs->SubSystemIsDisabled(name);
 	}
-	unique_ptr<FileHandle> OpenCompressedFile(QueryContext context, unique_ptr<FileHandle> handle, bool write) override {
+	unique_ptr<FileHandle> OpenCompressedFile(QueryContext context, unique_ptr<FileHandle> handle,
+	                                          bool write) override {
 		return wrapped_fs->OpenCompressedFile(context, std::move(handle), write);
 	}
 
@@ -221,6 +223,7 @@ public:
 		}
 		return "";
 	}
+
 private:
 	unique_ptr<FileSystem> wrapped_fs;
 	shared_ptr<BlobCache> cache;
@@ -228,7 +231,8 @@ private:
 
 class DebugFileSystem : public LocalFileSystem {
 public:
-	DebugFileSystem() : LocalFileSystem() {}
+	DebugFileSystem() : LocalFileSystem() {
+	}
 	~DebugFileSystem() override = default;
 
 	// Override to claim we can handle debug:// URLs
@@ -265,7 +269,6 @@ private:
 		}
 		return path;
 	}
-
 };
 
 // Cache management functions

@@ -38,8 +38,8 @@ namespace duckdb {
 
 // Cache type for dual-cache system
 enum class CacheType : uint8_t {
-	SMALL_RANGE = 0,  // Small ranges (default <= 2047 bytes)
-	LARGE_RANGE = 1   // Large ranges (> threshold)
+	SMALL_RANGE = 0, // Small ranges (default <= 2047 bytes)
+	LARGE_RANGE = 1  // Large ranges (> threshold)
 };
 
 // Statistics structure
@@ -55,10 +55,12 @@ struct CacheRangeInfo {
 // CacheFileBuffer - shared buffer with backpointer for background write completion
 struct CacheFileBuffer {
 	unique_ptr<char[]> data;
-	idx_t size;  // Size of data in buffer
-	std::atomic<idx_t>* file_offset_ptr;  // Backpointer to CacheRange::file_offset for write completion
+	idx_t size;                          // Size of data in buffer
+	std::atomic<idx_t> *file_offset_ptr; // Backpointer to CacheRange::file_offset for write completion
 
-	explicit CacheFileBuffer(idx_t buffer_size) : data(new char[buffer_size]), size(buffer_size), file_offset_ptr(nullptr) {}
+	explicit CacheFileBuffer(idx_t buffer_size)
+	    : data(new char[buffer_size]), size(buffer_size), file_offset_ptr(nullptr) {
+	}
 };
 
 //===----------------------------------------------------------------------===//
@@ -67,20 +69,21 @@ struct CacheFileBuffer {
 struct CacheRange {
 	static constexpr idx_t WRITE_NOT_COMPLETED_YET = static_cast<idx_t>(-1);
 
-	idx_t start = 0, end = 0; // range in remote blob file
-	std::atomic<idx_t> file_offset;  // Offset in cache file (-1 until write completes)
-	idx_t usage_count = 0, bytes_from_cache = 0;  // statistics
-	duckdb::shared_ptr<CacheFileBuffer> memory_buffer;  // Temporary in-memory buffer until disk write completes
+	idx_t start = 0, end = 0;                          // range in remote blob file
+	std::atomic<idx_t> file_offset;                    // Offset in cache file (-1 until write completes)
+	idx_t usage_count = 0, bytes_from_cache = 0;       // statistics
+	duckdb::shared_ptr<CacheFileBuffer> memory_buffer; // Temporary in-memory buffer until disk write completes
 
-	CacheRange(idx_t start, idx_t end) : start(start), end(end), file_offset(WRITE_NOT_COMPLETED_YET) {}
+	CacheRange(idx_t start, idx_t end) : start(start), end(end), file_offset(WRITE_NOT_COMPLETED_YET) {
+	}
 };
 
 struct CacheEntry {
-	string filename; // full URL
-	map<idx_t, unique_ptr<CacheRange>> ranges;  // Map of start position to unique CacheRange
-	idx_t cached_file_size = 0;  // Total bytes cached for this file
-	idx_t entry_id = 0; // unique entry-id ensures every filename is unique
-	CacheEntry* lru_prev = nullptr, *lru_next = nullptr; // LRU linked list pointers
+	string filename;                                     // full URL
+	map<idx_t, unique_ptr<CacheRange>> ranges;           // Map of start position to unique CacheRange
+	idx_t cached_file_size = 0;                          // Total bytes cached for this file
+	idx_t entry_id = 0;                                  // unique entry-id ensures every filename is unique
+	CacheEntry *lru_prev = nullptr, *lru_next = nullptr; // LRU linked list pointers
 };
 
 //===----------------------------------------------------------------------===//
@@ -88,14 +91,14 @@ struct CacheEntry {
 //===----------------------------------------------------------------------===//
 struct CacheConfig {
 	static constexpr idx_t DEFAULT_CACHE_CAPACITY = 1024ULL * 1024 * 1024; // 1GB default
-	static constexpr idx_t DEFAULT_SMALL_RANGE_THRESHOLD = 2047; // Default threshold for small ranges
+	static constexpr idx_t DEFAULT_SMALL_RANGE_THRESHOLD = 2047;           // Default threshold for small ranges
 	static constexpr idx_t FILENAME_SUFFIX_LEN = 15;
 
 	shared_ptr<DatabaseInstance> db_instance;
 	bool cache_initialized = false;
 	bool database_shutting_down = false; // Flag to indicate database shutdown in progress
-	string path_sep; // normally "/" ,but  "\" on windows
-	string cache_dir; // where we store data temporarilu
+	string path_sep;                     // normally "/" ,but  "\" on windows
+	string cache_dir;                    // where we store data temporarilu
 	idx_t total_cache_capacity = DEFAULT_CACHE_CAPACITY;
 	idx_t small_range_threshold = DEFAULT_SMALL_RANGE_THRESHOLD;
 	std::bitset<4095> subdirs_created; // Subdirectory tracking (shared by both caches)
@@ -121,8 +124,8 @@ struct CacheConfig {
 	string GenCacheFilePath(idx_t entry_id, const string &cache_key, CacheType type) const {
 		std::ostringstream oss;
 		oss << std::setw(19) << std::setfill('0') << entry_id;
-		return cache_dir + cache_key.substr(0, 4) + path_sep + cache_key.substr(4, 12)
-		       +  ((type == CacheType::SMALL_RANGE) ? 's' : 'l') + oss.str() + cache_key.substr(16);
+		return cache_dir + cache_key.substr(0, 4) + path_sep + cache_key.substr(4, 12) +
+		       ((type == CacheType::SMALL_RANGE) ? 's' : 'l') + oss.str() + cache_key.substr(16);
 	}
 
 	// cache_key(filename) = hex_hash64 ':' filename_suffix16 ':' protocol
@@ -135,8 +138,9 @@ struct CacheConfig {
 		hash_t hash_value = Hash(string_t(filename.c_str(), static_cast<uint32_t>(len)));
 		std::stringstream hex_stream;
 		hex_stream << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << hash_value;
-		return hex_stream.str() + ":" + filename.substr(std::max<idx_t>((slash != string::npos) * (slash + 1), suffix))
-		       + ":" + ((protocol != string::npos) ? StringUtil::Lower(filename.substr(0, protocol)) : "unknown");
+		return hex_stream.str() + ":" +
+		       filename.substr(std::max<idx_t>((slash != string::npos) * (slash + 1), suffix)) + ":" +
+		       ((protocol != string::npos) ? StringUtil::Lower(filename.substr(0, protocol)) : "unknown");
 	}
 
 	bool CleanCacheDir() const; // empty cache directory (remove all files and subdirs)
@@ -148,11 +152,12 @@ struct CacheConfig {
 struct CacheMap {
 	CacheConfig &config; // Reference to central configuration in BlobCache
 	unique_ptr<unordered_map<string, unique_ptr<CacheEntry>>> key_cache; // KV store
-	CacheEntry* lru_head = nullptr, *lru_tail = nullptr; // LRU
+	CacheEntry *lru_head = nullptr, *lru_tail = nullptr;                 // LRU
 	idx_t current_size = 0, num_ranges = 0, current_entry_id = 0;
 
 	explicit CacheMap(CacheConfig &cfg)
-	    : config(cfg), key_cache(make_uniq<unordered_map<string, unique_ptr<CacheEntry>>>()) {}
+	    : config(cfg), key_cache(make_uniq<unordered_map<string, unique_ptr<CacheEntry>>>()) {
+	}
 
 	// Cache state management
 	void Clear() {
@@ -164,11 +169,11 @@ struct CacheMap {
 	}
 
 	// Cache management operations
-	CacheEntry* FindCacheEntry(const string& cache_key, const string& filename) {
+	CacheEntry *FindCacheEntry(const string &cache_key, const string &filename) {
 		auto it = key_cache->find(cache_key);
 		return (it != key_cache->end() && it->second->filename == filename) ? it->second.get() : nullptr;
 	}
-	CacheEntry* UpsertCacheEntry(const string& cache_key, const string& filename) {
+	CacheEntry *UpsertCacheEntry(const string &cache_key, const string &filename) {
 		CacheEntry *cache_entry = nullptr;
 		auto it = key_cache->find(cache_key);
 		if (it == key_cache->end()) {
@@ -187,12 +192,13 @@ struct CacheMap {
 	}
 	size_t EvictCacheEntry(const string &cache_key, CacheType cache_type);
 	bool EvictToCapacity(idx_t required_space, CacheType cache_type, const string &exclude_filename = "");
-	void PurgeCacheForPatternChange(const vector<std::regex> &regexps, optional_ptr<FileOpener> opener, CacheType cache_type);
+	void PurgeCacheForPatternChange(const vector<std::regex> &regexps, optional_ptr<FileOpener> opener,
+	                                CacheType cache_type);
 
 	// LRU list management
-	void TouchLRU(CacheEntry* entry);
-	void RemoveFromLRU(CacheEntry* entry);
-	void AddToLRUFront(CacheEntry* entry);
+	void TouchLRU(CacheEntry *entry);
+	void RemoveFromLRU(CacheEntry *entry);
+	void AddToLRUFront(CacheEntry *entry);
 
 	// File operations (operate on cache_filepath which includes s/l prefix)
 	void EnsureSubdirectoryExists(const string &cache_filepath);
@@ -201,7 +207,7 @@ struct CacheMap {
 	bool ReadFromCacheFile(const string &cache_filepath, idx_t file_offset, void *buffer, idx_t length);
 	bool DeleteCacheFile(const string &cache_filepath);
 
-	vector<CacheRangeInfo> GetStatistics() const; 	// for blobcache_stats() table function
+	vector<CacheRangeInfo> GetStatistics() const; // for blobcache_stats() table function
 };
 
 //===----------------------------------------------------------------------===//
@@ -218,7 +224,7 @@ struct BlobCache {
 	unique_ptr<CacheMap> small_cache, large_cache;
 
 	// Cached regex patterns for file filtering (updated via callback)
-	mutable std::mutex regex_mutex; // Protects cached regex state
+	mutable std::mutex regex_mutex;    // Protects cached regex state
 	vector<std::regex> cached_regexps; // Compiled regex patterns
 
 	// Multi-threaded background cache writer system
@@ -230,12 +236,12 @@ struct BlobCache {
 	idx_t num_writer_threads;
 
 	// Helper methods for accessing cache and capacity by type
-	CacheMap& GetCacheMap(CacheType type) {
+	CacheMap &GetCacheMap(CacheType type) {
 		return type == CacheType::SMALL_RANGE ? *small_cache : *large_cache;
 	}
 	idx_t GetCacheCapacity(CacheType type) const {
 		return (type == CacheType::LARGE_RANGE)
-		           ? static_cast<idx_t>(config.total_cache_capacity * 0.9) // Large cache gets 90% of total capacity
+		           ? static_cast<idx_t>(config.total_cache_capacity * 0.9)    // Large cache gets 90% of total capacity
 		           : config.total_cache_capacity - large_cache->current_size; // small cache gets the rest
 	}
 
@@ -250,7 +256,7 @@ struct BlobCache {
 			config.db_instance = db_instance->shared_from_this();
 		}
 	}
-	~BlobCache() {// Set shutdown flag to prevent further logging attempts
+	~BlobCache() { // Set shutdown flag to prevent further logging attempts
 		config.database_shutting_down = true;
 		StopCacheWriterThreads();
 	}
@@ -280,13 +286,15 @@ struct BlobCache {
 		large_cache->Clear();
 	}
 	void PurgeCacheForPatternChange(optional_ptr<FileOpener> opener = nullptr) {
-		if (!config.cache_initialized) return;
+		if (!config.cache_initialized)
+			return;
 		std::lock_guard<std::mutex> cache_lock(cache_mutex);
 		small_cache->PurgeCacheForPatternChange(cached_regexps, opener, CacheType::SMALL_RANGE);
 		large_cache->PurgeCacheForPatternChange(cached_regexps, opener, CacheType::LARGE_RANGE);
 	}
 	void EvictFile(const string &filename) { // Evict from both caches
-		if (!config.cache_initialized) return;
+		if (!config.cache_initialized)
+			return;
 		std::lock_guard<std::mutex> lock(cache_mutex);
 		string cache_key = config.GenCacheKey(filename);
 		small_cache->EvictCacheEntry(cache_key, CacheType::SMALL_RANGE);

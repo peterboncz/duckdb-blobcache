@@ -14,7 +14,7 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileOpenFlags flags,
-                                                        optional_ptr<FileOpener> opener) {
+                                                       optional_ptr<FileOpener> opener) {
 	auto wrapped_handle = wrapped_fs->OpenFile(path, flags, opener);
 
 	if (cache->config.cache_initialized && flags.OpenForReading() && !flags.OpenForWriting()) {
@@ -26,10 +26,11 @@ unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileO
 	return wrapped_handle;
 }
 
-static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_handle, char* buffer, idx_t location, idx_t max_nr_bytes) {
+static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_handle, char *buffer, idx_t location,
+                       idx_t max_nr_bytes) {
 	// NOTE: ReadFromCache() can return cached_bytes == 0 but adjust max_nr_bytes downwards to align with a cached range
-	idx_t nr_bytes = blob_handle.cache->ReadFromCache(blob_handle.cache_key, blob_handle.original_path,
-	                                                  location, buffer, max_nr_bytes);
+	idx_t nr_bytes = blob_handle.cache->ReadFromCache(blob_handle.cache_key, blob_handle.original_path, location,
+	                                                  buffer, max_nr_bytes);
 #if 0
     if (nr_bytes > 0) { // debug
 		char *tmp_buffer = new char[nr_bytes];
@@ -44,14 +45,14 @@ static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_hand
 #endif
 	buffer += nr_bytes;
 	location += nr_bytes;
-	if (max_nr_bytes > nr_bytes)  { // Read the non-cached range and cache it
+	if (max_nr_bytes > nr_bytes) { // Read the non-cached range and cache it
 		idx_t nr_read = max_nr_bytes - nr_bytes;
 		wrapped_fs.Seek(*blob_handle.wrapped_handle, location);
 		nr_read = wrapped_fs.Read(*blob_handle.wrapped_handle, buffer, nr_read);
 		blob_handle.cache->InsertCache(blob_handle.cache_key, blob_handle.original_path, location, buffer, nr_read);
 		if (nr_read && blob_handle.cache_key.substr(blob_handle.cache_key.find_last_of(':')) == ":debug") {
 			// inspired on AnyBlob paper: lowest latency is 20ms, transfer 12MB/s for the first MB, 40MB/s beyond that
-			uint64_t ms = (nr_read < (1<<20)) ? (20 + ((80*nr_read)>>20)) : (75 + ((25*nr_read) >> 20));
+			uint64_t ms = (nr_read < (1 << 20)) ? (20 + ((80 * nr_read) >> 20)) : (75 + ((25 * nr_read) >> 20));
 			std::this_thread::sleep_for(std::chrono::milliseconds(ms)); // simulate S3 latency
 		}
 		location += nr_read;
@@ -61,7 +62,6 @@ static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_hand
 	return nr_bytes;
 }
 
-
 void BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
 	if (!blob_handle.cache || !cache->config.cache_initialized) {
@@ -69,7 +69,7 @@ void BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_by
 		return; // a read that cannot cache
 	}
 	// the ReadFromCache() can break down one large range into multiple around caching boundaries
-	char *buffer_ptr = static_cast<char*>(buffer);
+	char *buffer_ptr = static_cast<char *>(buffer);
 	idx_t chunk_bytes;
 	do { // keep iterating over ranges
 		chunk_bytes = ReadChunk(*wrapped_fs, blob_handle, buffer_ptr, location, nr_bytes);
@@ -84,7 +84,7 @@ int64_t BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr
 	if (!blob_handle.cache || !cache->config.cache_initialized) {
 		return wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes);
 	}
-	return ReadChunk(*wrapped_fs, blob_handle, static_cast<char*>(buffer), blob_handle.file_position, nr_bytes);
+	return ReadChunk(*wrapped_fs, blob_handle, static_cast<char *>(buffer), blob_handle.file_position, nr_bytes);
 }
 
 void BlobFilesystemWrapper::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
@@ -159,12 +159,12 @@ void WrapExistingFilesystems(DatabaseInstance &instance) {
 	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Filesystem type: %s", db_fs.GetName().c_str());
 
 	// Get VirtualFileSystem
-	auto vfs = dynamic_cast<VirtualFileSystem*>(&db_fs);
+	auto vfs = dynamic_cast<VirtualFileSystem *>(&db_fs);
 	if (!vfs) {
-		auto *opener_fs = dynamic_cast<OpenerFileSystem*>(&db_fs);
+		auto *opener_fs = dynamic_cast<OpenerFileSystem *>(&db_fs);
 		if (opener_fs) {
 			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Found OpenerFileSystem, getting wrapped VFS");
-			vfs = dynamic_cast<VirtualFileSystem*>(&opener_fs->GetFileSystem());
+			vfs = dynamic_cast<VirtualFileSystem *>(&opener_fs->GetFileSystem());
 		}
 	}
 	if (!vfs) {
@@ -182,7 +182,6 @@ void WrapExistingFilesystems(DatabaseInstance &instance) {
 	auto subsystems = vfs->ListSubSystems();
 	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Found %zu registered subsystems", subsystems.size());
 
-
 	for (const auto &name : subsystems) {
 		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Processing subsystem: '%s'", name.c_str());
 
@@ -195,7 +194,7 @@ void WrapExistingFilesystems(DatabaseInstance &instance) {
 		auto extracted_fs = vfs->ExtractSubSystem(name);
 		if (extracted_fs) {
 			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Successfully extracted subsystem: '%s' (GetName returns: '%s')",
-			                  name.c_str(), extracted_fs->GetName().c_str());
+			                 name.c_str(), extracted_fs->GetName().c_str());
 			auto wrapped_fs = make_uniq<BlobFilesystemWrapper>(std::move(extracted_fs), shared_cache);
 			DUCKDB_LOG_DEBUG(instance, "[BlobCache] Created wrapper with name: '%s'", wrapped_fs->GetName().c_str());
 			vfs->RegisterSubSystem(std::move(wrapped_fs));
