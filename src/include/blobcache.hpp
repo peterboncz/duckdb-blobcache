@@ -17,10 +17,6 @@
 #include <map>
 #include <sstream>
 #include <iomanip>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <dirent.h>
 #include <cstring>
 #include <bitset>
 #include <map>
@@ -95,6 +91,7 @@ struct CacheConfig {
 	static constexpr idx_t FILENAME_SUFFIX_LEN = 15;
 
 	shared_ptr<DatabaseInstance> db_instance;
+	FileSystem *file_system = nullptr; // Portable file system interface
 	bool cache_initialized = false;
 	bool database_shutting_down = false; // Flag to indicate database shutdown in progress
 	string path_sep;                     // normally "/" ,but  "\" on windows
@@ -115,9 +112,20 @@ struct CacheConfig {
 		}
 	}
 	// If the directory does not exist, create it, otherwise empty it
-	bool InitCacheDir() const {
-		struct stat st;
-		return stat(cache_dir.c_str(), &st) ? (mkdir(cache_dir.c_str(), 0755) == 0) : CleanCacheDir();
+	bool InitCacheDir() {
+		if (!file_system) {
+			return false;
+		}
+		if (!file_system->DirectoryExists(cache_dir)) {
+			try {
+				file_system->CreateDirectory(cache_dir);
+				return true;
+			} catch (const std::exception &e) {
+				LogError("Failed to create cache directory: " + string(e.what()));
+				return false;
+			}
+		}
+		return CleanCacheDir();
 	}
 
 	// inline to demonstrate path structure: /cache_dir/cache_key[0..3]/cache_key[4..15](s|l)entry_id:cache_key[16..]
@@ -143,7 +151,7 @@ struct CacheConfig {
 		       ((protocol != string::npos) ? StringUtil::Lower(filename.substr(0, protocol)) : "unknown");
 	}
 
-	bool CleanCacheDir() const; // empty cache directory (remove all files and subdirs)
+	bool CleanCacheDir(); // empty cache directory (remove all files and subdirs)
 };
 
 //===----------------------------------------------------------------------===//
@@ -202,7 +210,6 @@ struct CacheMap {
 
 	// File operations (operate on cache_filepath which includes s/l prefix)
 	void EnsureSubdirectoryExists(const string &cache_filepath);
-	int OpenCacheFile(const string &cache_filepath, int flags);
 	bool WriteToCacheFile(const string &cache_filepath, const void *buffer, idx_t length, idx_t &file_offset);
 	bool ReadFromCacheFile(const string &cache_filepath, idx_t file_offset, void *buffer, idx_t length);
 	bool DeleteCacheFile(const string &cache_filepath);

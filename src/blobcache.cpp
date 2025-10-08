@@ -6,41 +6,52 @@ namespace duckdb {
 // CacheConfig - Configuration and utility methods
 //===----------------------------------------------------------------------===//
 
-bool CacheConfig::CleanCacheDir() const {
-	DIR *dir = opendir(cache_dir.c_str());
-	if (!dir) {
-		return true;
+bool CacheConfig::CleanCacheDir() {
+	if (!file_system) {
+		return false;
 	}
-	auto success = true; // try to delete everything
-	struct dirent *entry;
-	while ((entry = readdir(dir)) != nullptr) {
-		// Skip . and ..
-		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-			continue;
-		}
-		string subdir_path = cache_dir + path_sep + entry->d_name;
+	if (!file_system->DirectoryExists(cache_dir)) {
+		return true; // Directory doesn't exist, nothing to clean
+	}
 
-		// Remove all files in subdirectory
-		DIR *subdir = opendir(subdir_path.c_str());
-		if (subdir) {
-			struct dirent *subentry;
-			while ((subentry = readdir(subdir)) != nullptr) {
-				if (strcmp(subentry->d_name, ".") == 0 || strcmp(subentry->d_name, "..") == 0) {
-					continue;
+	auto success = true;
+	try {
+		// List all subdirectories in cache_dir
+		file_system->ListFiles(cache_dir, [&](const string &name, bool is_dir) {
+			if (name == "." || name == "..") {
+				return;
+			}
+			string subdir_path = cache_dir + path_sep + name;
+
+			if (is_dir) {
+				// Remove all files in subdirectory
+				try {
+					file_system->ListFiles(subdir_path, [&](const string &subname, bool sub_is_dir) {
+						if (subname == "." || subname == "..") {
+							return;
+						}
+						string file_path = subdir_path + path_sep + subname;
+						try {
+							file_system->RemoveFile(file_path);
+						} catch (const std::exception &) {
+							success = false;
+						}
+					});
+				} catch (const std::exception &) {
+					success = false;
 				}
-				string file_path = subdir_path + path_sep + subentry->d_name;
-				if (unlink(file_path.c_str()) != 0) {
+
+				// Remove subdirectory
+				try {
+					file_system->RemoveDirectory(subdir_path);
+				} catch (const std::exception &) {
 					success = false;
 				}
 			}
-			closedir(subdir);
-		}
-		// Remove subdirectory
-		if (rmdir(subdir_path.c_str()) != 0) {
-			success = false;
-		}
+		});
+	} catch (const std::exception &) {
+		success = false;
 	}
-	closedir(dir);
 	return success;
 }
 
@@ -388,6 +399,9 @@ vector<CacheRangeInfo> CacheMap::GetStatistics() const { // produce list of cach
 //===----------------------------------------------------------------------===//
 
 void CacheMap::EnsureSubdirectoryExists(const string &cache_filepath) {
+	if (!config.file_system) {
+		return;
+	}
 	// Extract subdirectory from cache_filepath
 	// Format: /cachedir/1234/s567890 -> need to ensure /cachedir/1234/ exists
 	size_t last_sep = cache_filepath.find_last_of("/\\");
@@ -404,85 +418,79 @@ void CacheMap::EnsureSubdirectoryExists(const string &cache_filepath) {
 	if (config.subdirs_created[subdir_index]) {
 		return; // Already exists
 	}
-	if (mkdir(subdir_path.c_str(), 0755) == 0) {
-		config.LogDebug("Created cache subdirectory '" + subdir_path + "'");
-		config.subdirs_created[subdir_index] = true;
-	} else if (errno == EEXIST) {
-		config.subdirs_created[subdir_index] = true;
-	} else {
-		config.LogError("Failed to create cache subdirectory '" + subdir_path + "': " + string(strerror(errno)));
-	}
-}
 
-int CacheMap::OpenCacheFile(const string &cache_filepath, int flags) {
-	EnsureSubdirectoryExists(cache_filepath);
-	int fd = open(cache_filepath.c_str(), flags, 0644);
-	if (fd == -1) {
-		config.LogError("Failed to open cache file '" + cache_filepath + "': " + string(strerror(errno)));
+	try {
+		if (!config.file_system->DirectoryExists(subdir_path)) {
+			config.file_system->CreateDirectory(subdir_path);
+			config.LogDebug("Created cache subdirectory '" + subdir_path + "'");
+		}
+		config.subdirs_created[subdir_index] = true;
+	} catch (const std::exception &e) {
+		config.LogError("Failed to create cache subdirectory '" + subdir_path + "': " + string(e.what()));
 	}
-	return fd;
 }
 
 bool CacheMap::ReadFromCacheFile(const string &cache_filepath, idx_t file_offset, void *buffer, idx_t length) {
-	int flags = O_RDONLY;
-	int fd = OpenCacheFile(cache_filepath, flags);
-	if (fd == -1) {
+	if (!config.file_system) {
 		return false;
 	}
-	if (lseek(fd, file_offset, SEEK_SET) == -1) {
-		config.LogError("Failed to seek in cache file '" + cache_filepath + "' to offset " +
-		                std::to_string(file_offset) + ": " + string(strerror(errno)));
-		close(fd);
+
+	try {
+		auto handle = config.file_system->OpenFile(cache_filepath, FileOpenFlags::FILE_FLAGS_READ);
+		if (!handle) {
+			config.LogError("Failed to open cache file for reading: '" + cache_filepath + "'");
+			return false;
+		}
+
+		config.file_system->Read(*handle, buffer, length, file_offset);
+		return true;
+	} catch (const std::exception &e) {
+		config.LogError("Failed to read from cache file '" + cache_filepath + "': " + string(e.what()));
 		return false;
 	}
-	ssize_t bytes_read = read(fd, buffer, length);
-	close(fd);
-	if (bytes_read != static_cast<ssize_t>(length)) {
-		config.LogError("Failed to read " + std::to_string(length) + " bytes from cache file '" + cache_filepath +
-		                "' (read " + std::to_string(bytes_read) + "): " + string(strerror(errno)));
-		return false;
-	}
-	return true;
 }
 
 bool CacheMap::WriteToCacheFile(const string &cache_filepath, const void *buffer, idx_t length, idx_t &file_offset) {
-	// Open file for append to get current end position
-	int flags = O_WRONLY | O_CREAT | O_APPEND;
-	int fd = OpenCacheFile(cache_filepath, flags);
-	if (fd == -1) {
-		return false;
-	}
-	// Get current position (which is end of file due to O_APPEND)
-	file_offset = lseek(fd, 0, SEEK_CUR);
-	if (file_offset == (idx_t)-1) {
-		config.LogError("Failed to get file position for cache file '" + cache_filepath +
-		                "': " + string(strerror(errno)));
-		close(fd);
+	if (!config.file_system) {
 		return false;
 	}
 
-	// Explicitly seek to end before write to ensure correct append position
-	idx_t end_position = lseek(fd, 0, SEEK_END);
-	file_offset = end_position;
+	EnsureSubdirectoryExists(cache_filepath);
 
-	ssize_t bytes_written = write(fd, buffer, length);
-	close(fd);
-	if (bytes_written != static_cast<ssize_t>(length)) {
-		config.LogError("Failed to write " + std::to_string(length) + " bytes to cache file '" + cache_filepath +
-		                "' (wrote " + std::to_string(bytes_written) + "): " + string(strerror(errno)));
+	try {
+		// Open file for writing (create if not exists, append mode)
+		auto flags = FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE;
+		auto handle = config.file_system->OpenFile(cache_filepath, flags);
+		if (!handle) {
+			config.LogError("Failed to open cache file for writing: '" + cache_filepath + "'");
+			return false;
+		}
+
+		// Get current file size to know where to append
+		file_offset = static_cast<idx_t>(config.file_system->GetFileSize(*handle));
+
+		// Write data at the end
+		config.file_system->Write(*handle, const_cast<void *>(buffer), length, file_offset);
+		return true;
+	} catch (const std::exception &e) {
+		config.LogError("Failed to write to cache file '" + cache_filepath + "': " + string(e.what()));
 		return false;
 	}
-
-	return true;
 }
 
 bool CacheMap::DeleteCacheFile(const string &cache_filepath) {
-	if (unlink(cache_filepath.c_str()) != 0) {
-		config.LogError("Failed to delete cache file '" + cache_filepath + "': " + string(strerror(errno)));
+	if (!config.file_system) {
 		return false;
 	}
-	config.LogDebug("Deleted cache file '" + cache_filepath + "'");
-	return true;
+
+	try {
+		config.file_system->RemoveFile(cache_filepath);
+		config.LogDebug("Deleted cache file '" + cache_filepath + "'");
+		return true;
+	} catch (const std::exception &e) {
+		config.LogError("Failed to delete cache file '" + cache_filepath + "': " + string(e.what()));
+		return false;
+	}
 }
 
 //===----------------------------------------------------------------------===//

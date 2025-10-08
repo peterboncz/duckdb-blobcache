@@ -147,6 +147,8 @@ shared_ptr<BlobCache> GetOrCreateBlobCache(DatabaseInstance &instance) {
 
 	// Create new cache and store in ObjectCache
 	auto new_cache = make_shared_ptr<BlobCache>(&instance);
+	// Initialize filesystem pointer for portable file operations
+	new_cache->config.file_system = &FileSystem::GetFileSystem(instance);
 	auto cache_entry = make_shared_ptr<BlobCacheEntry>(new_cache);
 	object_cache.Put("blobcache_instance", cache_entry);
 	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Created and stored new BlobCache in ObjectCache");
