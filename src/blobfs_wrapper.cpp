@@ -7,6 +7,11 @@
 #include <thread>
 #include <chrono>
 
+// Windows.h defines MoveFile/MoveFileA macros that conflict with DuckDB's MoveFile method
+#ifdef MoveFile
+#undef MoveFile
+#endif
+
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
