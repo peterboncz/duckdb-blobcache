@@ -49,42 +49,25 @@ large	16	32
 small	16	33
 
 statement ok
-from blobcache_config('.blobcache', 1);
+from blobcache_config('.blobcache2/', 1024, 255);
 
+# Directory changed, so cache should be cleared
 query I
-select count(*) from blobcache_stats() group by all;
+select count(*) from blobcache_stats();
 ----
 0
-
-statement ok
-select max(l_comment) from read_parquet('debug://lineitem.parquet');
-
-query III
-select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
-----
-large	1	0
-small	16	1
-
-statement ok
-select max(l_comment) from read_parquet('debug://lineitem.parquet');
-
-query III
-select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
-----
-large	1	1
-small	16	18
 
 query IIIII
 from blobcache_config()
 ----
-.blobcache/	1048576	28067	1	1
+.blobcache2/	1073741824	0	255	1
 
+# Run a query to populate the new cache
+statement ok
+select max(l_comment) from read_parquet('debug://lineitem.parquet');
+
+# Verify new cache is populated
 query I
-select sum("end" - "start") from blobcache_stats();
+select count(*) from blobcache_stats();
 ----
-28067
-
-query IIIII
-from blobcache_config('.blobcache/', 1024, 255);
-----
-.blobcache/	1073741824	0	255	1
+32

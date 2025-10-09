@@ -458,8 +458,9 @@ bool CacheMap::WriteToCacheFile(const string &cache_filepath, const void *buffer
 	EnsureSubdirectoryExists(cache_filepath);
 
 	try {
-		// Open file for writing (create if not exists, append mode)
-		auto flags = FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE;
+		// Open file for writing in append mode (create if not exists)
+		auto flags =
+		    FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE | FileOpenFlags::FILE_FLAGS_APPEND;
 		auto handle = config.file_system->OpenFile(cache_filepath, flags);
 		if (!handle) {
 			config.LogError("Failed to open cache file for writing: '" + cache_filepath + "'");
@@ -469,7 +470,7 @@ bool CacheMap::WriteToCacheFile(const string &cache_filepath, const void *buffer
 		// Get current file size to know where to append
 		file_offset = static_cast<idx_t>(config.file_system->GetFileSize(*handle));
 
-		// Write data at the end
+		// Write data at the end (append mode ensures we write at the end)
 		config.file_system->Write(*handle, const_cast<void *>(buffer), length, file_offset);
 		return true;
 	} catch (const std::exception &e) {
