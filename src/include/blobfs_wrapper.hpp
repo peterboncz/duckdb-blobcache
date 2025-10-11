@@ -1,16 +1,62 @@
 #pragma once
 
+// Undefine Windows macros BEFORE any includes
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
+
 #include "duckdb.hpp"
-#include "duckdb/common/file_system.hpp"
+
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
+
 #include "duckdb/common/local_file_system.hpp"
-#include "duckdb/main/config.hpp"
+
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
+
 #include "duckdb/main/database.hpp"
+
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
+
 #include "duckdb/common/virtual_file_system.hpp"
+
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
+
 #include "duckdb/common/opener_file_system.hpp"
+
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
+
 #include "duckdb/storage/object_cache.hpp"
+
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
+
 #include "blobcache.hpp"
 
-// Undefine Windows macros that conflict with DuckDB method names
 #ifdef WIN32
 #undef CreateDirectory
 #undef MoveFile

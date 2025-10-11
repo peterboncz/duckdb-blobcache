@@ -1,32 +1,51 @@
 #pragma once
 
+// Undefine Windows macros BEFORE any includes
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
+
 #include "duckdb.hpp"
-#include "duckdb/common/exception.hpp"
-#include "duckdb/common/string_util.hpp"
-#include "duckdb/common/file_system.hpp"
-#include "duckdb/common/virtual_file_system.hpp"
-// #include "duckdb/common/opener_file_system.hpp"
+
+// Undefine again after duckdb.hpp
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
+
 #include "duckdb/common/file_opener.hpp"
-#include "duckdb/logging/logger.hpp"
-#include "duckdb/common/unordered_map.hpp"
-#include "duckdb/common/types/hash.hpp"
-#include "duckdb/common/types/string_type.hpp"
-#include <iostream>
-#include <memory>
-#include <mutex>
-#include <map>
-#include <sstream>
-#include <iomanip>
-#include <cstring>
-#include <bitset>
-#include <map>
-#include <thread>
-#include <queue>
-#include <condition_variable>
-#include <atomic>
+
+// Undefine AGAIN after file_opener
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
+
 #include <regex>
 
-// Undefine Windows macros that conflict with DuckDB method names
+// Undefine after regex
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
+
+#include <iomanip>
+
+// Undefine after iomanip
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
+
+#include <thread>
+
+// Undefine after thread
 #ifdef WIN32
 #undef CreateDirectory
 #undef MoveFile
