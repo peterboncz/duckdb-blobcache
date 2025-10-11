@@ -95,7 +95,7 @@ public:
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
 	void Truncate(FileHandle &handle, int64_t new_size) override;
-	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
+	//void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
 	bool TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override {
 		if (cache) {
