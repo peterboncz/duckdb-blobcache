@@ -5,7 +5,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/virtual_file_system.hpp"
-#include "duckdb/common/opener_file_system.hpp"
+// #include "duckdb/common/opener_file_system.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/common/unordered_map.hpp"
