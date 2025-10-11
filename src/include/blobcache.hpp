@@ -26,6 +26,13 @@
 #include <atomic>
 #include <regex>
 
+// Undefine Windows macros that conflict with DuckDB method names
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
+
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//

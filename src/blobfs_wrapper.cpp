@@ -7,10 +7,6 @@
 #include <thread>
 #include <chrono>
 
-#ifdef MoveFile
-#undef MoveFile // Windows.h defines MoveFile/MoveFileA macros that conflict with DuckDB's MoveFile method
-#endif
-
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
@@ -121,6 +117,7 @@ void BlobFilesystemWrapper::Truncate(FileHandle &handle, int64_t new_size) {
 	wrapped_fs->Truncate(*blob_handle.wrapped_handle, new_size);
 }
 
+#if 0
 void BlobFilesystemWrapper::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
 	if (cache) {
 		cache->EvictFile(source);
@@ -128,6 +125,7 @@ void BlobFilesystemWrapper::MoveFile(const string &source, const string &target,
 	}
 	wrapped_fs->MoveFile(source, target, opener);
 }
+#endif
 
 void BlobFilesystemWrapper::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
 	if (cache) {

@@ -5,13 +5,17 @@
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
-#ifdef MoveFile
-#undef MoveFile // Windows.h defines MoveFile/MoveFileA macros that conflict with DuckDB's MoveFile method
-#endif
 #include "duckdb/common/virtual_file_system.hpp"
 #include "duckdb/common/opener_file_system.hpp"
 #include "duckdb/storage/object_cache.hpp"
 #include "blobcache.hpp"
+
+// Undefine Windows macros that conflict with DuckDB method names
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
 
 namespace duckdb {
 
