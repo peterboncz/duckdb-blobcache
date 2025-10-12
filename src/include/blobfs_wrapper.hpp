@@ -1,6 +1,5 @@
 #pragma once
 
-// Undefine Windows macros BEFORE any includes
 #ifdef WIN32
 #undef CreateDirectory
 #undef MoveFile
