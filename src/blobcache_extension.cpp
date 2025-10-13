@@ -3,6 +3,7 @@
 #include "blobcache_extension.hpp"
 #include "blobfs_wrapper.hpp"
 #include "duckdb/storage/object_cache.hpp"
+#include "duckdb/storage/external_file_cache.hpp"
 
 namespace duckdb {
 
@@ -41,7 +42,7 @@ struct BlobCacheConfigBindData : public FunctionData {
 // Global state for both table functions
 struct BlobCacheGlobalState : public GlobalTableFunctionState {
 	idx_t tuples_processed = 0;
-	vector<CacheRangeInfo> small_stats, large_stats;
+	vector<BlobCacheRangeInfo> small_stats, large_stats;
 
 	idx_t MaxThreads() const override {
 		return 1; // Single threaded for simplicity
@@ -154,7 +155,7 @@ static unique_ptr<GlobalTableFunctionState> BlobCacheStatsInitGlobal(ClientConte
 // Bind function for blobcache_stats
 static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
-	// Setup return schema - returns cache statistics with 8 columns (added cache_type)
+	// Setup return schema - returns cache statistics with 9 columns (added bytes_from_ram)
 	return_types.push_back(LogicalType::VARCHAR); // protocol
 	return_types.push_back(LogicalType::VARCHAR); // filename
 	return_types.push_back(LogicalType::VARCHAR); // cache_type
@@ -163,6 +164,7 @@ static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, Table
 	return_types.push_back(LogicalType::BIGINT);  // end
 	return_types.push_back(LogicalType::BIGINT);  // usage_count
 	return_types.push_back(LogicalType::BIGINT);  // bytes_from_cache
+	return_types.push_back(LogicalType::BIGINT);  // bytes_from_ram
 
 	names.push_back("protocol");
 	names.push_back("filename");
@@ -172,6 +174,7 @@ static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, Table
 	names.push_back("end");
 	names.push_back("usage_count");
 	names.push_back("bytes_from_cache");
+	names.push_back("bytes_from_ram");
 
 	return nullptr; // No bind data needed for stats function
 }
@@ -275,6 +278,7 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 		output.data[5].SetValue(i, Value::BIGINT(info.end));
 		output.data[6].SetValue(i, Value::BIGINT(info.usage_count));
 		output.data[7].SetValue(i, Value::BIGINT(info.bytes_from_cache));
+		output.data[8].SetValue(i, Value::BIGINT(info.bytes_from_ram));
 	}
 	global_state.tuples_processed += chunk_size;
 }
@@ -300,6 +304,12 @@ void BlobcacheExtension::Load(ExtensionLoader &loader) {
 
 	// Get configuration for callbacks
 	auto &config = DBConfig::GetConfig(instance);
+
+	// Disable global external file cache to avoid double-caching with our disk cache
+	// Our CachingFileSystem will still work (allocates BufferHandle but doesn't cache ranges)
+	config.options.enable_external_file_cache = false;
+	ExternalFileCache::Get(instance).SetEnabled(false);
+	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Disabled global external file cache");
 
 	// Register table functions
 	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Registering table functions...");
