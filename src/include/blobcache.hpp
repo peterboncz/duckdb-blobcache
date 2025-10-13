@@ -1,56 +1,10 @@
 #pragma once
 
-// Undefine Windows macros BEFORE any includes
-#ifdef WIN32
-#undef CreateDirectory
-#undef MoveFile
-#undef RemoveDirectory
-#endif
-
 #include "duckdb.hpp"
-
-// Undefine again after duckdb.hpp
-#ifdef WIN32
-#undef CreateDirectory
-#undef MoveFile
-#undef RemoveDirectory
-#endif
-
 #include "duckdb/common/file_opener.hpp"
-
-// Undefine AGAIN after file_opener
-#ifdef WIN32
-#undef CreateDirectory
-#undef MoveFile
-#undef RemoveDirectory
-#endif
-
 #include <regex>
-
-// Undefine after regex
-#ifdef WIN32
-#undef CreateDirectory
-#undef MoveFile
-#undef RemoveDirectory
-#endif
-
 #include <iomanip>
-
-// Undefine after iomanip
-#ifdef WIN32
-#undef CreateDirectory
-#undef MoveFile
-#undef RemoveDirectory
-#endif
-
 #include <thread>
-
-// Undefine after thread
-#ifdef WIN32
-#undef CreateDirectory
-#undef MoveFile
-#undef RemoveDirectory
-#endif
 
 namespace duckdb {
 
