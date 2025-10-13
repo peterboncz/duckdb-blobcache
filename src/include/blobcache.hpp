@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <thread>
 
+
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
@@ -78,14 +79,18 @@ struct CacheConfig {
 	static constexpr idx_t FILENAME_SUFFIX_LEN = 15;
 
 	shared_ptr<DatabaseInstance> db_instance;
-	FileSystem *file_system = nullptr; // Portable file system interface
 	bool cache_initialized = false;
 	bool database_shutting_down = false; // Flag to indicate database shutdown in progress
-	string path_sep;                     // normally "/" ,but  "\" on windows
+	string path_sep;                     // normally "/", but  "\" on windows
 	string cache_dir;                    // where we store data temporarilu
 	idx_t total_cache_capacity = DEFAULT_CACHE_CAPACITY;
 	idx_t small_range_threshold = DEFAULT_SMALL_RANGE_THRESHOLD;
 	std::bitset<4095> subdirs_created; // Subdirectory tracking (shared by both caches)
+
+	// Get FileSystem reference from database instance
+	FileSystem &GetFileSystem() const {
+		return FileSystem::GetFileSystem(*db_instance);
+	}
 
 	// Logging methods
 	void LogDebug(const string &message) const {
@@ -100,12 +105,13 @@ struct CacheConfig {
 	}
 	// If the directory does not exist, create it, otherwise empty it
 	bool InitCacheDir() {
-		if (!file_system) {
+		if (!db_instance) {
 			return false;
 		}
-		if (!file_system->DirectoryExists(cache_dir)) {
+		auto &fs = GetFileSystem();
+		if (!fs.DirectoryExists(cache_dir)) {
 			try {
-				file_system->CreateDirectory(cache_dir);
+				fs.CreateDirectory(cache_dir);
 				return true;
 			} catch (const std::exception &e) {
 				LogError("Failed to create cache directory: " + string(e.what()));

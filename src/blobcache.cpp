@@ -7,17 +7,18 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 
 bool CacheConfig::CleanCacheDir() {
-	if (!file_system) {
+	if (!db_instance) {
 		return false;
 	}
-	if (!file_system->DirectoryExists(cache_dir)) {
+	auto &fs = GetFileSystem();
+	if (!fs.DirectoryExists(cache_dir)) {
 		return true; // Directory doesn't exist, nothing to clean
 	}
 
 	auto success = true;
 	try {
 		// List all subdirectories in cache_dir
-		file_system->ListFiles(cache_dir, [&](const string &name, bool is_dir) {
+		fs.ListFiles(cache_dir, [&](const string &name, bool is_dir) {
 			if (name == "." || name == "..") {
 				return;
 			}
@@ -26,13 +27,13 @@ bool CacheConfig::CleanCacheDir() {
 			if (is_dir) {
 				// Remove all files in subdirectory
 				try {
-					file_system->ListFiles(subdir_path, [&](const string &subname, bool sub_is_dir) {
+					fs.ListFiles(subdir_path, [&](const string &subname, bool sub_is_dir) {
 						if (subname == "." || subname == "..") {
 							return;
 						}
 						string file_path = subdir_path + path_sep + subname;
 						try {
-							file_system->RemoveFile(file_path);
+							fs.RemoveFile(file_path);
 						} catch (const std::exception &) {
 							success = false;
 						}
@@ -43,7 +44,7 @@ bool CacheConfig::CleanCacheDir() {
 
 				// Remove subdirectory
 				try {
-					file_system->RemoveDirectory(subdir_path);
+					fs.RemoveDirectory(subdir_path);
 				} catch (const std::exception &) {
 					success = false;
 				}
@@ -272,7 +273,7 @@ void BlobCache::CacheWriterThreadLoop(idx_t thread_id) {
 		idx_t file_offset;
 		if (cache.WriteToCacheFile(cache_filepath, file_buffer->data.get(), file_buffer->size, file_offset)) {
 			// Successfully wrote to cache file, update the CacheRange::file_offset atomically via backpointer
-			file_buffer->file_offset_ptr->store(file_offset);
+			file_buffer->file_offset_ptr->store(file_offset, std::memory_order_release);
 			config.LogDebug("Background writer completed write for cache_filepath '" + cache_filepath + "'");
 		}
 	}
@@ -399,7 +400,7 @@ vector<CacheRangeInfo> CacheMap::GetStatistics() const { // produce list of cach
 //===----------------------------------------------------------------------===//
 
 void CacheMap::EnsureSubdirectoryExists(const string &cache_filepath) {
-	if (!config.file_system) {
+	if (!config.db_instance) {
 		return;
 	}
 	// Extract subdirectory from cache_filepath
@@ -420,8 +421,9 @@ void CacheMap::EnsureSubdirectoryExists(const string &cache_filepath) {
 	}
 
 	try {
-		if (!config.file_system->DirectoryExists(subdir_path)) {
-			config.file_system->CreateDirectory(subdir_path);
+		auto &fs = config.GetFileSystem();
+		if (!fs.DirectoryExists(subdir_path)) {
+			fs.CreateDirectory(subdir_path);
 			config.LogDebug("Created cache subdirectory '" + subdir_path + "'");
 		}
 		config.subdirs_created[subdir_index] = true;
@@ -431,18 +433,19 @@ void CacheMap::EnsureSubdirectoryExists(const string &cache_filepath) {
 }
 
 bool CacheMap::ReadFromCacheFile(const string &cache_filepath, idx_t file_offset, void *buffer, idx_t length) {
-	if (!config.file_system) {
+	if (!config.db_instance) {
 		return false;
 	}
 
 	try {
-		auto handle = config.file_system->OpenFile(cache_filepath, FileOpenFlags::FILE_FLAGS_READ);
+		auto &fs = config.GetFileSystem();
+		auto handle = fs.OpenFile(cache_filepath, FileOpenFlags::FILE_FLAGS_READ);
 		if (!handle) {
 			config.LogError("Failed to open cache file for reading: '" + cache_filepath + "'");
 			return false;
 		}
 
-		config.file_system->Read(*handle, buffer, length, file_offset);
+		fs.Read(*handle, buffer, length, file_offset);
 		return true;
 	} catch (const std::exception &e) {
 		config.LogError("Failed to read from cache file '" + cache_filepath + "': " + string(e.what()));
@@ -451,27 +454,41 @@ bool CacheMap::ReadFromCacheFile(const string &cache_filepath, idx_t file_offset
 }
 
 bool CacheMap::WriteToCacheFile(const string &cache_filepath, const void *buffer, idx_t length, idx_t &file_offset) {
-	if (!config.file_system) {
+	if (!config.db_instance) {
 		return false;
 	}
 
 	EnsureSubdirectoryExists(cache_filepath);
 
 	try {
+		auto &fs = config.GetFileSystem();
 		// Open file for writing in append mode (create if not exists)
 		auto flags =
 		    FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE | FileOpenFlags::FILE_FLAGS_APPEND;
-		auto handle = config.file_system->OpenFile(cache_filepath, flags);
+		auto handle = fs.OpenFile(cache_filepath, flags);
 		if (!handle) {
 			config.LogError("Failed to open cache file for writing: '" + cache_filepath + "'");
 			return false;
 		}
 
-		// Get current file size to know where to append
-		file_offset = static_cast<idx_t>(config.file_system->GetFileSize(*handle));
+		// Get current file size to know where we're appending
+		file_offset = static_cast<idx_t>(fs.GetFileSize(*handle));
 
-		// Write data at the end (append mode ensures we write at the end)
-		config.file_system->Write(*handle, const_cast<void *>(buffer), length, file_offset);
+		// Write data using sequential write (append mode automatically positions at end)
+		int64_t bytes_written = fs.Write(*handle, const_cast<void *>(buffer), length);
+
+		if (bytes_written != static_cast<int64_t>(length)) {
+			config.LogError("Failed to write all bytes to cache file (wrote " + std::to_string(bytes_written) +
+			               " of " + std::to_string(length) + ")");
+			handle->Close();
+			return false;
+		}
+
+		// Flush to disk to ensure data is written
+		fs.FileSync(*handle);
+
+		// Close handle explicitly
+		handle->Close();
 		return true;
 	} catch (const std::exception &e) {
 		config.LogError("Failed to write to cache file '" + cache_filepath + "': " + string(e.what()));
@@ -480,12 +497,13 @@ bool CacheMap::WriteToCacheFile(const string &cache_filepath, const void *buffer
 }
 
 bool CacheMap::DeleteCacheFile(const string &cache_filepath) {
-	if (!config.file_system) {
+	if (!config.db_instance) {
 		return false;
 	}
 
 	try {
-		config.file_system->RemoveFile(cache_filepath);
+		auto &fs = config.GetFileSystem();
+		fs.RemoveFile(cache_filepath);
 		config.LogDebug("Deleted cache file '" + cache_filepath + "'");
 		return true;
 	} catch (const std::exception &e) {
