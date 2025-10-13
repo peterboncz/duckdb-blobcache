@@ -1,11 +1,5 @@
 #include "blobfs_wrapper.hpp"
 #include "blobcache.hpp"
-// #include "duckdb/common/virtual_file_system.hpp"
-// #include "duckdb/common/file_opener.hpp"
-// #include "duckdb/logging/logger.hpp"
-// #include "duckdb/common/string_util.hpp"
-// #include <thread>
-// #include <chrono>
 
 namespace duckdb {
 
@@ -117,7 +111,6 @@ void BlobFilesystemWrapper::Truncate(FileHandle &handle, int64_t new_size) {
 	wrapped_fs->Truncate(*blob_handle.wrapped_handle, new_size);
 }
 
-#if 0
 void BlobFilesystemWrapper::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
 	if (cache) {
 		cache->EvictFile(source);
@@ -125,7 +118,6 @@ void BlobFilesystemWrapper::MoveFile(const string &source, const string &target,
 	}
 	wrapped_fs->MoveFile(source, target, opener);
 }
-#endif
 
 void BlobFilesystemWrapper::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
 	if (cache) {
