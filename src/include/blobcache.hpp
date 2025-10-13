@@ -1,5 +1,12 @@
 #pragma once
 
+// Undefine Windows macros BEFORE any includes
+#ifdef WIN32
+#undef CreateDirectory
+#undef MoveFile
+#undef RemoveDirectory
+#endif
+
 #include "duckdb.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include <regex>
