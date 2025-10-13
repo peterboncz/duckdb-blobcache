@@ -7,60 +7,12 @@
 #endif
 
 #include "duckdb.hpp"
-
-#ifdef WIN32
-#undef CreateDirectory
-#undef MoveFile
-#undef RemoveDirectory
-#endif
-
 #include "duckdb/common/local_file_system.hpp"
-
-#ifdef WIN32
-#undef CreateDirectory
-#undef MoveFile
-#undef RemoveDirectory
-#endif
-
 #include "duckdb/main/database.hpp"
-
-#ifdef WIN32
-#undef CreateDirectory
-#undef MoveFile
-#undef RemoveDirectory
-#endif
-
 #include "duckdb/common/virtual_file_system.hpp"
-
-#ifdef WIN32
-#undef CreateDirectory
-#undef MoveFile
-#undef RemoveDirectory
-#endif
-
 #include "duckdb/common/opener_file_system.hpp"
-
-#ifdef WIN32
-#undef CreateDirectory
-#undef MoveFile
-#undef RemoveDirectory
-#endif
-
 #include "duckdb/storage/object_cache.hpp"
-
-#ifdef WIN32
-#undef CreateDirectory
-#undef MoveFile
-#undef RemoveDirectory
-#endif
-
 #include "blobcache.hpp"
-
-#ifdef WIN32
-#undef CreateDirectory
-#undef MoveFile
-#undef RemoveDirectory
-#endif
 
 namespace duckdb {
 
