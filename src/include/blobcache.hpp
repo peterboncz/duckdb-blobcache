@@ -61,7 +61,7 @@ struct BlobCacheFileBuffer {
 //===----------------------------------------------------------------------===//
 struct BlobCacheFileRange {
 	idx_t range_start = 0, range_end = 0;                            // Range in remote blob file
-	std::atomic<idx_t> blobcache_range_start;                        // Offset in cache file (pre-computed for memcache)
+	idx_t blobcache_range_start;                                     // Offset in cache file (pre-computed for memcache)
 	std::atomic<bool> disk_write_completed;                          // True when background write to disk completes
 	idx_t usage_count = 0, bytes_from_cache = 0, bytes_from_mem = 0; // Statistics
 	duckdb::shared_ptr<BlobCacheFileBuffer> memcache_buffer; // In-memory buffer (references ExternalFileCache buffer)
@@ -216,8 +216,8 @@ struct BlobCacheMap {
 	unique_ptr<FileHandle> TryOpenCacheFile(const string &cache_filepath);
 	bool WriteToCacheFile(const string &blobcache_filepath, const void *buffer, idx_t length,
 	                      idx_t &blobcache_range_start);
-	bool ReadFromCacheFile(const string &blobcache_filepath, idx_t blobcache_range_start, void *buffer, idx_t length,
-	                       idx_t &out_bytes_from_mem);
+	bool ReadFromCacheFile(const string &blobcache_filepath, idx_t blobcache_range_start, void *buffer,
+	                       idx_t &length, idx_t &out_bytes_from_mem); // read length may be reduced
 	bool DeleteCacheFile(const string &cache_filepath);
 
 	vector<BlobCacheRangeInfo> GetStatistics() const; // for blobcache_stats() table function
@@ -284,9 +284,10 @@ struct BlobCache {
 	void StartIOThreads(idx_t thread_count);
 	void StopIOThreads();
 
-	// Memory cache helper
+	// Memory cache helpers
 	void InsertRangeIntoMemcache(const string &blobcache_filepath, idx_t blobcache_range_start,
 	                             BufferHandle &buffer_handle, idx_t length);
+	bool TryReadFromMemcache(const string &blobcache_filepath, idx_t blobcache_range_start, void *buffer, idx_t &length);
 
 	// Core cache operations
 	void InsertCache(const string &cache_key, const string &filename, idx_t start_pos, void *buf, idx_t len);

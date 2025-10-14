@@ -49,7 +49,7 @@ idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename, 
 	hit_range->usage_count++;
 
 	// CRITICAL: Copy everything we need before unlocking
-	idx_t cached_blobcache_range_start = hit_range->blobcache_range_start.load(std::memory_order_acquire);
+	idx_t cached_blobcache_range_start = hit_range->blobcache_range_start;
 	auto file_id = blobcache_file->file_id;
 	idx_t saved_range_start = hit_range->range_start; // Save range start to relocate it after reacquiring lock
 	lock.unlock(); // do the longer-running things unlocked (note: blobcache_file might get deleted!)
@@ -57,15 +57,14 @@ idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename, 
 	// Always read via ReadFromCacheFile, which tries memcache first, then disk
 	idx_t bytes_from_mem = 0;
 	string blobcache_filepath = config.GenCacheFilePath(file_id, cache_key, blobcache_type);
-	if (!blobcache.ReadFromCacheFile(blobcache_filepath, cached_blobcache_range_start + offset, buffer, hit_size,
-	                                 bytes_from_mem)) {
+	if (!blobcache.ReadFromCacheFile(blobcache_filepath, cached_blobcache_range_start + offset, buffer,
+	                                 hit_size, bytes_from_mem)) { // hit_size may be reduced even on success
 		hit_size = 0; // read from cached file failed! -- can be legal as it could have been deleted by eviction
 	}
 
 	// If we had a memory blobcache hit, update the bytes_from_mem counter
 	if (bytes_from_mem > 0) {
-		lock.lock();
-		// Reacquire lock and update range's bytes_from_mem counter (handle eviction race)
+		lock.lock(); // Reacquire lock and update range's bytes_from_mem counter (handle eviction race)
 		blobcache_file = blobcache.FindFile(cache_key, filename);
 		if (blobcache_file && blobcache_file->file_id == file_id) {
 			auto range_it = blobcache_file->ranges.find(saved_range_start);
@@ -78,23 +77,23 @@ idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename, 
 	return hit_size; // No blobcache hit, return 0 to indicate wrapped_fs should be used
 }
 
+// we had to read from the original source (e.g. S3). Now try to cache this buffer in the disk-based blobcache
 void BlobCache::InsertCache(const string &cache_key, const string &filename, idx_t position, void *buffer,
                             idx_t max_nr_bytes) {
-	BlobCacheType blobcache_type = // Determine blobcache type based on original request size
-	    (max_nr_bytes <= config.small_range_threshold) ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
-	BlobCacheMap &blobcache = GetCacheMap(blobcache_type);
-
 	if (!config.blobcache_initialized || !max_nr_bytes ||
 	    static_cast<idx_t>(max_nr_bytes) > config.total_cache_capacity) {
 		return;
 	}
-	std::unique_lock<std::mutex> lock(blobcache_mutex); // lock caches
+	BlobCacheType blobcache_type = // Determine blobcache type based on original request size
+	    (max_nr_bytes <= config.small_range_threshold) ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
+	BlobCacheMap &blobcache = GetCacheMap(blobcache_type);
 
+	std::lock_guard<std::mutex> lock(regex_mutex);
 	auto blobcache_file = blobcache.UpsertFile(cache_key, filename);
 	if (!blobcache_file) {
 		return; // name collision (rare)
 	}
-	// Check if range already cached
+	// Check (under lock) if range already cached (in the meantime, due to concurrent reads)
 	auto hit_range = AnalyzeRange(blobcache_file->ranges, position, max_nr_bytes);
 	idx_t offset = 0, actual_bytes = 0, range_start_pos = position, range_end_pos = range_start_pos + max_nr_bytes;
 	if (hit_range) { // another thread cached the same range in the meantime
@@ -105,7 +104,7 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 		actual_bytes = range_end_pos - range_start_pos;
 	}
 	if (actual_bytes == 0 || !EvictToCapacity(actual_bytes, filename)) {
-		return; // back off, do not blobcache this range
+		return; // back off, do not cache this range
 	}
 
 	// Create new range and update stats
@@ -117,22 +116,19 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 	blobcache.num_ranges++;
 
 	// Pre-compute blobcache_range_start (we append sequentially, so we know the offset in advance)
-	idx_t blobcache_range_start = blobcache_file->current_blobcache_file_offset;
-	range_ptr->blobcache_range_start.store(blobcache_range_start, std::memory_order_release); // Set immediately
-	blobcache_file->current_blobcache_file_offset += actual_bytes;                            // Update for next write
+	range_ptr->blobcache_range_start = blobcache_file->current_blobcache_file_offset;
+	blobcache_file->current_blobcache_file_offset += actual_bytes; // Update for next write
 
 	// Generate blobcache filepath
 	string blobcache_filepath = config.GenCacheFilePath(blobcache_file->file_id, cache_key, blobcache_type);
-
-	lock.unlock(); // Release global mutex
 
 	// Allocate from BufferManager (for memory caching) and copy data outside lock
 	auto &buffer_manager = blobfile_memcache->GetBufferManager();
 	auto buffer_handle = buffer_manager.Allocate(MemoryTag::EXTERNAL_FILE_CACHE, actual_bytes);
 	std::memcpy(buffer_handle.Ptr(), static_cast<const char *>(buffer) + offset, actual_bytes);
 
-	// Insert into ExternalFileCache immediately (for memory hits on next read)
-	InsertRangeIntoMemcache(blobcache_filepath, blobcache_range_start, buffer_handle, actual_bytes);
+	// Now register this cached piece of blobcache file in the memcache (even though it is not written yet)
+	InsertRangeIntoMemcache(blobcache_filepath, range_ptr->blobcache_range_start, buffer_handle, actual_bytes);
 
 	// schedule the writing of this new ranfe
 	auto file_buffer =
@@ -145,7 +141,7 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 }
 
 //===----------------------------------------------------------------------===//
-// Memory cache helper
+// Memory cache helpers
 //===----------------------------------------------------------------------===//
 
 void BlobCache::InsertRangeIntoMemcache(const string &blobcache_filepath, idx_t blobcache_range_start,
@@ -155,6 +151,37 @@ void BlobCache::InsertRangeIntoMemcache(const string &blobcache_filepath, idx_t 
 	                                                                          blobcache_range_start, "");
 	auto lock_guard = memcache_file.lock.GetExclusiveLock();
 	memcache_file.Ranges(lock_guard)[blobcache_range_start] = memcache_range;
+	config.LogDebug("Inserted into memcache: '" + blobcache_filepath + "' at offset " +
+	                std::to_string(blobcache_range_start) + " length " + std::to_string(length));
+}
+
+bool BlobCache::TryReadFromMemcache(const string &blobcache_filepath, idx_t blobcache_range_start, void *buffer,
+                                    idx_t &length) {
+	if (!blobfile_memcache) {
+		return false;
+	}
+	// Check if the range is already cached in memory
+	auto &memcache_file = blobfile_memcache->GetOrCreateCachedFile(blobcache_filepath);
+	auto memcache_ranges_guard = memcache_file.lock.GetSharedLock();
+	auto &memcache_ranges = memcache_file.Ranges(memcache_ranges_guard);
+	auto it = memcache_ranges.find(blobcache_range_start);
+	auto &memcache_range = *it->second;
+	if (it == memcache_ranges.end() || memcache_range.nr_bytes == 0) {
+		return false; // mem-cached range not found or empty
+	}
+	config.LogDebug("Memory cache hit for " +  to_string(length) + " bytes in '" + blobcache_filepath + "',  offset "
+	                + to_string(blobcache_range_start) + " with length " + to_string(memcache_range.nr_bytes));
+	auto &buffer_manager = blobfile_memcache->GetBufferManager();
+	auto pin = buffer_manager.Pin(memcache_range.block_handle);
+	if (!pin.IsValid()) { // Try to pin the block handle
+		config.LogDebug("Pinning cache hit failed -- apparently there is high memory pressure");
+		return false;
+	}
+	if (memcache_range.nr_bytes < length) {
+		length = memcache_range.nr_bytes;
+	}
+	std::memcpy(buffer, pin.Ptr(), length); // Memory hit - read from BufferHandle
+	return true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -355,7 +382,7 @@ BlobCacheMap::GetStatistics() const { // produce list of cached ranges for blobc
 			info.filename = info.filename.substr(pos + 3, info.filename.length() - (pos + 3));
 		}
 		for (const auto &range_pair : current->ranges) {
-			info.blobcache_range_start = range_pair.second->blobcache_range_start.load(std::memory_order_acquire);
+			info.blobcache_range_start = range_pair.second->blobcache_range_start;
 			info.range_start = range_pair.second->range_start;
 			info.range_size = range_pair.second->range_end - range_pair.second->range_start;
 			info.usage_count = range_pair.second->usage_count;
@@ -416,57 +443,24 @@ unique_ptr<FileHandle> BlobCacheMap::TryOpenCacheFile(const string &cache_filepa
 }
 
 bool BlobCacheMap::ReadFromCacheFile(const string &blobcache_filepath, idx_t blobcache_range_start, void *buffer,
-                                     idx_t length, idx_t &out_bytes_from_mem) {
+                                     idx_t &length, idx_t &out_bytes_from_mem) {
+	if (config.parent_cache->TryReadFromMemcache(blobcache_filepath, blobcache_range_start, buffer, length)) {
+		out_bytes_from_mem = length;
+		return true; // reading from memcache first succeeded
+	}
+	// Not in memory cache - read from disk and cache it
 	out_bytes_from_mem = 0; // Initialize to 0 (disk read)
-	if (!config.db_instance || !config.parent_cache || !config.parent_cache->blobfile_memcache) {
-		return false;
-	}
-	// Try to get cached file from our memcache (ExternalFileCache)
-	auto &memcache = *config.parent_cache->blobfile_memcache;
-	auto &memcache_file = memcache.GetOrCreateCachedFile(blobcache_filepath);
-
-	// Check if the range is already cached in memory
-	auto memcache_ranges_guard = memcache_file.lock.GetSharedLock();
-	auto &memcache_ranges = memcache_file.Ranges(memcache_ranges_guard);
-
-	// Look for cached range at blobcache_range_start
-	auto it = memcache_ranges.find(blobcache_range_start);
-	if (it != memcache_ranges.end()) {
-		auto &memcache_range = *it->second;
-		if (memcache_range.nr_bytes == length) {
-			// Try to pin the block handle
-			auto &buffer_manager = memcache.GetBufferManager();
-			auto pin = buffer_manager.Pin(memcache_range.block_handle);
-			if (pin.IsValid()) {
-				// Memory hit - read from BufferHandle
-				auto buffer_ptr = pin.Ptr();
-				std::memcpy(buffer, buffer_ptr, length);
-				out_bytes_from_mem = length; // Mark as memory hit
-				config.LogDebug("Memory cache hit for '" + blobcache_filepath + "' at offset " +
-				                std::to_string(blobcache_range_start) + " length " + std::to_string(length));
-				return true;
-			}
-		}
-	}
-	memcache_ranges_guard.reset(); // Not in memory cache - read from disk and cache it
-
 	auto handle = TryOpenCacheFile(blobcache_filepath);
 	if (!handle) {
 		return false; // File was evicted or doesn't exist - signal cache miss
 	}
-	auto &fs = config.GetFileSystem();
-
 	// allocate memory using the DuckDB buffer manager
-	auto &buffer_manager = memcache.GetBufferManager();
+	auto &buffer_manager = config.parent_cache->blobfile_memcache->GetBufferManager();
 	auto buffer_handle = buffer_manager.Allocate(MemoryTag::EXTERNAL_FILE_CACHE, length);
 	auto buffer_ptr = buffer_handle.Ptr();
-
-	fs.Read(*handle, buffer_ptr, length, blobcache_range_start); // Read from disk into buffer
-	std::memcpy(buffer, buffer_ptr, length);                     // Copy to output buffer
-	// Insert into cache for future use
+	config.GetFileSystem().Read(*handle, buffer_ptr, length, blobcache_range_start); // Read from disk into buffer
+	std::memcpy(buffer, buffer_ptr, length);                                         // Copy to output buffer
 	config.parent_cache->InsertRangeIntoMemcache(blobcache_filepath, blobcache_range_start, buffer_handle, length);
-	config.LogDebug("Disk read and cached for '" + blobcache_filepath + "' at offset " +
-	                std::to_string(blobcache_range_start) + " length " + std::to_string(length));
 	return true;
 }
 
@@ -590,7 +584,8 @@ bool BlobCache::EvictToCapacity(idx_t extra_bytes, const string &exclude_filenam
 // BlobCache (re-) configuration
 //===----------------------------------------------------------------------===//
 
-void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx_t io_threads, idx_t small_threshold) {
+void
+BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx_t max_io_threads, idx_t small_threshold) {
 	std::lock_guard<std::mutex> lock(blobcache_mutex);
 	auto directory = base_dir + (StringUtil::EndsWith(base_dir, config.path_sep) ? "" : config.path_sep);
 	if (!config.blobcache_initialized) {
@@ -601,7 +596,7 @@ void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx
 
 		config.LogDebug("Initializing cache: directory='" + config.blobcache_dir +
 		                "' max_size=" + std::to_string(config.total_cache_capacity) +
-		                " bytes io_threads=" + std::to_string(io_threads) +
+		                " bytes io_threads=" + std::to_string(max_io_threads) +
 		                " small_threshold=" + std::to_string(config.small_range_threshold));
 		if (!config.InitCacheDir()) {
 			config.LogError("Initializing cache directory='" + config.blobcache_dir + "' failed");
@@ -611,12 +606,12 @@ void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx
 		// Initialize our own ExternalFileCache instance (always enabled for memory caching)
 		blobfile_memcache = make_uniq<ExternalFileCache>(*config.db_instance, true);
 		config.LogDebug("Initialized blobfile_memcache for memory caching of disk-cached files");
-		StartIOThreads(io_threads);
+		StartIOThreads(max_io_threads);
 		return;
 	}
 
 	// Cache already initialized, check what needs to be changed
-	bool need_restart_threads = (num_io_threads != io_threads);
+	bool need_restart_threads = (num_io_threads != max_io_threads);
 	bool directory_changed = (config.blobcache_dir != directory);
 	bool size_reduced = (max_size_bytes < config.total_cache_capacity);
 	bool size_changed = (config.total_cache_capacity != max_size_bytes);
@@ -628,10 +623,10 @@ void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx
 
 	// Stop existing threads if we need to change thread count or directory
 	config.LogDebug("Configuring cache: old_dir='" + config.blobcache_dir + "' new_dir='" + directory + "' old_size=" +
-	                std::to_string(config.total_cache_capacity) + " new_size=" + std::to_string(max_size_bytes) +
-	                " old_threads=" + std::to_string(num_io_threads) + " new_threads=" + std::to_string(io_threads) +
-	                " old_threshold=" + std::to_string(config.small_range_threshold) +
-	                " new_threshold=" + std::to_string(small_threshold));
+	                std::to_string(config.total_cache_capacity) + " new_size=" + std::to_string(max_size_bytes)
+	                + " old_threshold=" + std::to_string(config.small_range_threshold)
+	                + " new_threshold=" + std::to_string(small_threshold) + " old_threads="
+	                + std::to_string(num_io_threads) + " new_threads=" + std::to_string(max_io_threads));
 	if (num_io_threads > 0 && (need_restart_threads || directory_changed)) {
 		config.LogDebug("Stopping existing cache IO threads for reconfiguration");
 		StopIOThreads();
@@ -662,11 +657,11 @@ void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx
 	}
 	// Start threads if they were stopped or thread count changed
 	if (need_restart_threads || directory_changed) {
-		StartIOThreads(io_threads);
+		StartIOThreads(max_io_threads);
 	}
 	config.LogDebug("Cache configuration complete: directory='" + config.blobcache_dir + "' max_size=" +
-	                std::to_string(config.total_cache_capacity) + " bytes io_threads=" + std::to_string(io_threads) +
-	                " small_threshold=" + std::to_string(config.small_range_threshold));
+	                to_string(config.total_cache_capacity) + " bytes io_threads=" +
+	                to_string(max_io_threads) + " small_threshold=" + to_string(config.small_range_threshold));
 }
 
 //===----------------------------------------------------------------------===//
