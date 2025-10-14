@@ -11,7 +11,7 @@ unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileO
                                                        optional_ptr<FileOpener> opener) {
 	auto wrapped_handle = wrapped_fs->OpenFile(path, flags, opener);
 
-	if (cache->config.cache_initialized && flags.OpenForReading() && !flags.OpenForWriting()) {
+	if (cache->config.blobcache_initialized && flags.OpenForReading() && !flags.OpenForWriting()) {
 		if (cache->ShouldCacheFile(path, opener)) {
 			string cache_key = cache->config.GenCacheKey(path);
 			return make_uniq<BlobFileHandle>(*this, path, std::move(wrapped_handle), cache_key, cache);
@@ -58,7 +58,7 @@ static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_hand
 
 void BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
-	if (!blob_handle.cache || !cache->config.cache_initialized) {
+	if (!blob_handle.cache || !cache->config.blobcache_initialized) {
 		wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes, location);
 		return; // a read that cannot cache
 	}
@@ -75,7 +75,7 @@ void BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_by
 
 int64_t BlobFilesystemWrapper::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	auto &blob_handle = handle.Cast<BlobFileHandle>();
-	if (!blob_handle.cache || !cache->config.cache_initialized) {
+	if (!blob_handle.cache || !cache->config.blobcache_initialized) {
 		return wrapped_fs->Read(*blob_handle.wrapped_handle, buffer, nr_bytes);
 	}
 	return ReadChunk(*wrapped_fs, blob_handle, static_cast<char *>(buffer), blob_handle.file_position, nr_bytes);
@@ -168,7 +168,7 @@ void WrapExistingFilesystems(DatabaseInstance &instance) {
 
 	// Get the shared cache instance - only proceed if cache is initialized
 	auto shared_cache = GetOrCreateBlobCache(instance);
-	if (!shared_cache->config.cache_initialized) {
+	if (!shared_cache->config.blobcache_initialized) {
 		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Cache not initialized yet, skipping filesystem wrapping");
 		return;
 	}

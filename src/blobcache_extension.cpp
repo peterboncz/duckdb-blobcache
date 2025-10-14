@@ -17,32 +17,32 @@ struct BlobCacheConfigBindData : public FunctionData {
 	idx_t max_size_mb;
 	idx_t writer_threads;
 	string regex_patterns;       // New regex patterns parameter
-	idx_t small_range_threshold; // Small range threshold parameter
+	idx_t smallrange_threshold; // Small range threshold parameter
 	bool query_only;             // True if no parameters provided - just query current values
 
 	BlobCacheConfigBindData(string dir, idx_t size, idx_t threads, string regexps = "", idx_t threshold = 2047,
 	                        bool query = false)
 	    : directory(std::move(dir)), max_size_mb(size), writer_threads(threads), regex_patterns(std::move(regexps)),
-	      small_range_threshold(threshold), query_only(query) {
+	      smallrange_threshold(threshold), query_only(query) {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<BlobCacheConfigBindData>(directory, max_size_mb, writer_threads, regex_patterns,
-		                                          small_range_threshold, query_only);
+		                                          smallrange_threshold, query_only);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<BlobCacheConfigBindData>();
 		return directory == other.directory && max_size_mb == other.max_size_mb &&
 		       writer_threads == other.writer_threads && regex_patterns == other.regex_patterns &&
-		       small_range_threshold == other.small_range_threshold && query_only == other.query_only;
+		       smallrange_threshold == other.smallrange_threshold && query_only == other.query_only;
 	}
 };
 
 // Global state for both table functions
 struct BlobCacheGlobalState : public GlobalTableFunctionState {
 	idx_t tuples_processed = 0;
-	vector<BlobCacheRangeInfo> small_stats, large_stats;
+	vector<BlobCacheRangeInfo> smallrange_stats, largerange_stats;
 
 	idx_t MaxThreads() const override {
 		return 1; // Single threaded for simplicity
@@ -155,26 +155,26 @@ static unique_ptr<GlobalTableFunctionState> BlobCacheStatsInitGlobal(ClientConte
 // Bind function for blobcache_stats
 static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
-	// Setup return schema - returns cache statistics with 9 columns (added bytes_from_ram)
+	// Setup return schema - returns cache statistics with 9 columns
 	return_types.push_back(LogicalType::VARCHAR); // protocol
 	return_types.push_back(LogicalType::VARCHAR); // filename
 	return_types.push_back(LogicalType::VARCHAR); // cache_type
-	return_types.push_back(LogicalType::BIGINT);  // file_offset
-	return_types.push_back(LogicalType::BIGINT);  // start
-	return_types.push_back(LogicalType::BIGINT);  // end
+	return_types.push_back(LogicalType::BIGINT);  // blobcache_range_start
+	return_types.push_back(LogicalType::BIGINT);  // range_start
+	return_types.push_back(LogicalType::BIGINT);  // range_size
 	return_types.push_back(LogicalType::BIGINT);  // usage_count
 	return_types.push_back(LogicalType::BIGINT);  // bytes_from_cache
-	return_types.push_back(LogicalType::BIGINT);  // bytes_from_ram
+	return_types.push_back(LogicalType::BIGINT);  // bytes_from_mem
 
 	names.push_back("protocol");
 	names.push_back("filename");
 	names.push_back("cache_type");
-	names.push_back("file_offset");
-	names.push_back("start");
-	names.push_back("end");
+	names.push_back("blobcache_range_start");
+	names.push_back("range_start");
+	names.push_back("range_size");
 	names.push_back("usage_count");
 	names.push_back("bytes_from_cache");
-	names.push_back("bytes_from_ram");
+	names.push_back("bytes_from_mem");
 
 	return nullptr; // No bind data needed for stats function
 }
@@ -212,11 +212,11 @@ static void BlobCacheConfigFunction(ClientContext &context, TableFunctionInput &
 			                 "[BlobCache] Configuring cache: directory='%s', max_size=%zu MB, writer_threads=%zu, "
 			                 "regex_patterns='%s', small_range_threshold=%zu",
 			                 bind_data.directory.c_str(), bind_data.max_size_mb, bind_data.writer_threads,
-			                 bind_data.regex_patterns.c_str(), bind_data.small_range_threshold);
+			                 bind_data.regex_patterns.c_str(), bind_data.smallrange_threshold);
 
 			// Configure cache first (including small_range_threshold)
 			shared_cache->ConfigureCache(bind_data.directory, bind_data.max_size_mb * 1024 * 1024,
-			                             bind_data.writer_threads, bind_data.small_range_threshold);
+			                             bind_data.writer_threads, bind_data.smallrange_threshold);
 
 			// Update regex patterns and purge non-qualifying cache entries
 			shared_cache->UpdateRegexPatterns(bind_data.regex_patterns);
@@ -228,11 +228,11 @@ static void BlobCacheConfigFunction(ClientContext &context, TableFunctionInput &
 	}
 
 	// Get current cache statistics (works whether configuration succeeded or not)
-	if (shared_cache && shared_cache->config.cache_initialized) {
-		cache_path = shared_cache->config.cache_dir;
+	if (shared_cache && shared_cache->config.blobcache_initialized) {
+		cache_path = shared_cache->config.blobcache_dir;
 		max_size_bytes = shared_cache->config.total_cache_capacity;
-		current_size_bytes = shared_cache->small_cache->current_size + shared_cache->large_cache->current_size;
-		writer_threads = shared_cache->num_writer_threads;
+		current_size_bytes = shared_cache->smallrange_blobcache->current_size + shared_cache->largerange_blobcache->current_size;
+		writer_threads = shared_cache->num_io_threads;
 	}
 
 	// Return the statistics tuple
@@ -252,18 +252,18 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 	// Load data on first call
 	if (global_state.tuples_processed == 0) {
 		auto cache = GetOrCreateBlobCache(*context.db);
-		std::lock_guard<std::mutex> lock(cache->cache_mutex);
-		global_state.small_stats = cache->small_cache->GetStatistics();
-		global_state.large_stats = cache->large_cache->GetStatistics();
+		std::lock_guard<std::mutex> lock(cache->blobcache_mutex);
+		global_state.smallrange_stats = cache->smallrange_blobcache->GetStatistics();
+		global_state.largerange_stats = cache->largerange_blobcache->GetStatistics();
 	}
 
 	// Determine which cache to serve from
-	auto &stats = (global_state.tuples_processed < global_state.small_stats.size()) ? global_state.small_stats
-	                                                                                : global_state.large_stats;
-	auto cache_type = (global_state.tuples_processed < global_state.small_stats.size()) ? "small" : "large";
-	idx_t offset = (global_state.tuples_processed < global_state.small_stats.size())
+	auto &stats = (global_state.tuples_processed < global_state.smallrange_stats.size()) ? global_state.smallrange_stats
+	                                                                                : global_state.largerange_stats;
+	auto cache_type = (global_state.tuples_processed < global_state.smallrange_stats.size()) ? "small" : "large";
+	idx_t offset = (global_state.tuples_processed < global_state.smallrange_stats.size())
 	                   ? global_state.tuples_processed
-	                   : global_state.tuples_processed - global_state.small_stats.size();
+	                   : global_state.tuples_processed - global_state.smallrange_stats.size();
 
 	idx_t chunk_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, stats.size() - offset);
 	output.SetCardinality(chunk_size);
@@ -273,12 +273,12 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 		output.data[0].SetValue(i, Value(info.protocol));
 		output.data[1].SetValue(i, Value(info.filename));
 		output.data[2].SetValue(i, Value(cache_type));
-		output.data[3].SetValue(i, Value::BIGINT(info.file_offset));
-		output.data[4].SetValue(i, Value::BIGINT(info.start));
-		output.data[5].SetValue(i, Value::BIGINT(info.end));
+		output.data[3].SetValue(i, Value::BIGINT(info.blobcache_range_start));
+		output.data[4].SetValue(i, Value::BIGINT(info.range_start));
+		output.data[5].SetValue(i, Value::BIGINT(info.range_size));
 		output.data[6].SetValue(i, Value::BIGINT(info.usage_count));
 		output.data[7].SetValue(i, Value::BIGINT(info.bytes_from_cache));
-		output.data[8].SetValue(i, Value::BIGINT(info.bytes_from_ram));
+		output.data[8].SetValue(i, Value::BIGINT(info.bytes_from_mem));
 	}
 	global_state.tuples_processed += chunk_size;
 }
