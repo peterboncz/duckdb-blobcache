@@ -216,8 +216,8 @@ struct BlobCacheMap {
 	unique_ptr<FileHandle> TryOpenCacheFile(const string &cache_filepath);
 	bool WriteToCacheFile(const string &blobcache_filepath, const void *buffer, idx_t length,
 	                      idx_t &blobcache_range_start);
-	bool ReadFromCacheFile(const string &blobcache_filepath, idx_t blobcache_range_start, void *buffer,
-	                       idx_t &length, idx_t &out_bytes_from_mem); // read length may be reduced
+	bool ReadFromCacheFile(const string &blobcache_filepath, idx_t blobcache_range_start, void *buffer, idx_t &length,
+	                       idx_t &out_bytes_from_mem); // read length may be reduced
 	bool DeleteCacheFile(const string &cache_filepath);
 
 	vector<BlobCacheRangeInfo> GetStatistics() const; // for blobcache_stats() table function
@@ -287,7 +287,8 @@ struct BlobCache {
 	// Memory cache helpers
 	void InsertRangeIntoMemcache(const string &blobcache_filepath, idx_t blobcache_range_start,
 	                             BufferHandle &buffer_handle, idx_t length);
-	bool TryReadFromMemcache(const string &blobcache_filepath, idx_t blobcache_range_start, void *buffer, idx_t &length);
+	bool TryReadFromMemcache(const string &blobcache_filepath, idx_t blobcache_range_start, void *buffer,
+	                         idx_t &length);
 
 	// Core cache operations
 	void InsertCache(const string &cache_key, const string &filename, idx_t start_pos, void *buf, idx_t len);

@@ -57,8 +57,8 @@ idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename, 
 	// Always read via ReadFromCacheFile, which tries memcache first, then disk
 	idx_t bytes_from_mem = 0;
 	string blobcache_filepath = config.GenCacheFilePath(file_id, cache_key, blobcache_type);
-	if (!blobcache.ReadFromCacheFile(blobcache_filepath, cached_blobcache_range_start + offset, buffer,
-	                                 hit_size, bytes_from_mem)) { // hit_size may be reduced even on success
+	if (!blobcache.ReadFromCacheFile(blobcache_filepath, cached_blobcache_range_start + offset, buffer, hit_size,
+	                                 bytes_from_mem)) { // hit_size may be reduced even on success
 		hit_size = 0; // read from cached file failed! -- can be legal as it could have been deleted by eviction
 	}
 
@@ -169,8 +169,8 @@ bool BlobCache::TryReadFromMemcache(const string &blobcache_filepath, idx_t blob
 	if (it == memcache_ranges.end() || memcache_range.nr_bytes == 0) {
 		return false; // mem-cached range not found or empty
 	}
-	config.LogDebug("Memory cache hit for " +  to_string(length) + " bytes in '" + blobcache_filepath + "',  offset "
-	                + to_string(blobcache_range_start) + " with length " + to_string(memcache_range.nr_bytes));
+	config.LogDebug("Memory cache hit for " + to_string(length) + " bytes in '" + blobcache_filepath + "',  offset " +
+	                to_string(blobcache_range_start) + " with length " + to_string(memcache_range.nr_bytes));
 	auto &buffer_manager = blobfile_memcache->GetBufferManager();
 	auto pin = buffer_manager.Pin(memcache_range.block_handle);
 	if (!pin.IsValid()) { // Try to pin the block handle
@@ -584,8 +584,8 @@ bool BlobCache::EvictToCapacity(idx_t extra_bytes, const string &exclude_filenam
 // BlobCache (re-) configuration
 //===----------------------------------------------------------------------===//
 
-void
-BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx_t max_io_threads, idx_t small_threshold) {
+void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx_t max_io_threads,
+                               idx_t small_threshold) {
 	std::lock_guard<std::mutex> lock(blobcache_mutex);
 	auto directory = base_dir + (StringUtil::EndsWith(base_dir, config.path_sep) ? "" : config.path_sep);
 	if (!config.blobcache_initialized) {
@@ -623,10 +623,10 @@ BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx_t ma
 
 	// Stop existing threads if we need to change thread count or directory
 	config.LogDebug("Configuring cache: old_dir='" + config.blobcache_dir + "' new_dir='" + directory + "' old_size=" +
-	                std::to_string(config.total_cache_capacity) + " new_size=" + std::to_string(max_size_bytes)
-	                + " old_threshold=" + std::to_string(config.small_range_threshold)
-	                + " new_threshold=" + std::to_string(small_threshold) + " old_threads="
-	                + std::to_string(num_io_threads) + " new_threads=" + std::to_string(max_io_threads));
+	                std::to_string(config.total_cache_capacity) + " new_size=" + std::to_string(max_size_bytes) +
+	                " old_threshold=" + std::to_string(config.small_range_threshold) + " new_threshold=" +
+	                std::to_string(small_threshold) + " old_threads=" + std::to_string(num_io_threads) +
+	                " new_threads=" + std::to_string(max_io_threads));
 	if (num_io_threads > 0 && (need_restart_threads || directory_changed)) {
 		config.LogDebug("Stopping existing cache IO threads for reconfiguration");
 		StopIOThreads();
@@ -660,8 +660,8 @@ BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx_t ma
 		StartIOThreads(max_io_threads);
 	}
 	config.LogDebug("Cache configuration complete: directory='" + config.blobcache_dir + "' max_size=" +
-	                to_string(config.total_cache_capacity) + " bytes io_threads=" +
-	                to_string(max_io_threads) + " small_threshold=" + to_string(config.small_range_threshold));
+	                to_string(config.total_cache_capacity) + " bytes io_threads=" + to_string(max_io_threads) +
+	                " small_threshold=" + to_string(config.small_range_threshold));
 }
 
 //===----------------------------------------------------------------------===//
