@@ -89,11 +89,11 @@ struct BlobCacheConfig {
 	static constexpr idx_t FILENAME_SUFFIX_LEN = 15;
 
 	shared_ptr<DatabaseInstance> db_instance;
-	BlobCache *parent_cache = nullptr;  // Reference to parent BlobCache for accessing blobfile_memcache
+	BlobCache *parent_cache = nullptr; // Reference to parent BlobCache for accessing blobfile_memcache
 	bool blobcache_initialized = false;
 	bool blobcache_shutting_down = false; // Flag to indicate database shutdown in progress
-	string path_sep;  // normally "/", but  "\" on windows
-	string blobcache_dir;  // where we store data temporarilu
+	string path_sep;                      // normally "/", but  "\" on windows
+	string blobcache_dir;                 // where we store data temporarilu
 	idx_t total_cache_capacity = DEFAULT_CACHE_CAPACITY;
 	idx_t small_range_threshold = DEFAULT_SMALL_RANGE_THRESHOLD;
 	std::bitset<4095> subdirs_created; // Subdirectory tracking (shared by both caches)
@@ -257,7 +257,7 @@ struct BlobCache {
 	}
 	idx_t GetCacheCapacity(BlobCacheType type) const {
 		return (type == BlobCacheType::LARGE_RANGE)
-		           ? static_cast<idx_t>(config.total_cache_capacity * 0.9)    // Large cache gets 90% of total capacity
+		           ? static_cast<idx_t>(config.total_cache_capacity * 0.9) // Large cache gets 90% of total capacity
 		           : config.total_cache_capacity - largerange_blobcache->current_size; // small cache gets the rest
 	}
 
@@ -266,8 +266,8 @@ struct BlobCache {
 
 	// Constructor/Destructor
 	explicit BlobCache(DatabaseInstance *db_instance = nullptr)
-	    : smallrange_blobcache(make_uniq<BlobCacheMap>(config)),
-	      largerange_blobcache(make_uniq<BlobCacheMap>(config)), shutdown_io_threads(false), num_io_threads(1) {
+	    : smallrange_blobcache(make_uniq<BlobCacheMap>(config)), largerange_blobcache(make_uniq<BlobCacheMap>(config)),
+	      shutdown_io_threads(false), num_io_threads(1) {
 		if (db_instance) {
 			config.db_instance = db_instance->shared_from_this();
 		}

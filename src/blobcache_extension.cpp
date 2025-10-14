@@ -16,9 +16,9 @@ struct BlobCacheConfigBindData : public FunctionData {
 	string directory;
 	idx_t max_size_mb;
 	idx_t writer_threads;
-	string regex_patterns;       // New regex patterns parameter
+	string regex_patterns;      // New regex patterns parameter
 	idx_t smallrange_threshold; // Small range threshold parameter
-	bool query_only;             // True if no parameters provided - just query current values
+	bool query_only;            // True if no parameters provided - just query current values
 
 	BlobCacheConfigBindData(string dir, idx_t size, idx_t threads, string regexps = "", idx_t threshold = 2047,
 	                        bool query = false)
@@ -231,7 +231,8 @@ static void BlobCacheConfigFunction(ClientContext &context, TableFunctionInput &
 	if (shared_cache && shared_cache->config.blobcache_initialized) {
 		cache_path = shared_cache->config.blobcache_dir;
 		max_size_bytes = shared_cache->config.total_cache_capacity;
-		current_size_bytes = shared_cache->smallrange_blobcache->current_size + shared_cache->largerange_blobcache->current_size;
+		current_size_bytes =
+		    shared_cache->smallrange_blobcache->current_size + shared_cache->largerange_blobcache->current_size;
 		writer_threads = shared_cache->num_io_threads;
 	}
 
@@ -258,8 +259,9 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 	}
 
 	// Determine which cache to serve from
-	auto &stats = (global_state.tuples_processed < global_state.smallrange_stats.size()) ? global_state.smallrange_stats
-	                                                                                : global_state.largerange_stats;
+	auto &stats = (global_state.tuples_processed < global_state.smallrange_stats.size())
+	                  ? global_state.smallrange_stats
+	                  : global_state.largerange_stats;
 	auto cache_type = (global_state.tuples_processed < global_state.smallrange_stats.size()) ? "small" : "large";
 	idx_t offset = (global_state.tuples_processed < global_state.smallrange_stats.size())
 	                   ? global_state.tuples_processed

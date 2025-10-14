@@ -84,7 +84,8 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 	    (max_nr_bytes <= config.small_range_threshold) ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
 	BlobCacheMap &blobcache = GetCacheMap(blobcache_type);
 
-	if (!config.blobcache_initialized || !max_nr_bytes || static_cast<idx_t>(max_nr_bytes) > config.total_cache_capacity) {
+	if (!config.blobcache_initialized || !max_nr_bytes ||
+	    static_cast<idx_t>(max_nr_bytes) > config.total_cache_capacity) {
 		return;
 	}
 	std::unique_lock<std::mutex> lock(blobcache_mutex); // lock caches
@@ -118,7 +119,7 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 	// Pre-compute blobcache_range_start (we append sequentially, so we know the offset in advance)
 	idx_t blobcache_range_start = blobcache_file->current_blobcache_file_offset;
 	range_ptr->blobcache_range_start.store(blobcache_range_start, std::memory_order_release); // Set immediately
-	blobcache_file->current_blobcache_file_offset += actual_bytes;                                // Update for next write
+	blobcache_file->current_blobcache_file_offset += actual_bytes;                            // Update for next write
 
 	// Generate blobcache filepath
 	string blobcache_filepath = config.GenCacheFilePath(blobcache_file->file_id, cache_key, blobcache_type);
@@ -160,9 +161,8 @@ void BlobCache::InsertRangeIntoMemcache(const string &blobcache_filepath, idx_t 
 // Multi-threaded background cache writer implementation
 //===----------------------------------------------------------------------===//
 
-void BlobCache::QueueIOWrite(const string &filepath, idx_t partition,
-                                duckdb::shared_ptr<BlobCacheFileBuffer> buffer) {
-	{ 	// Use first 2 hex chars from filepath for partitioning
+void BlobCache::QueueIOWrite(const string &filepath, idx_t partition, duckdb::shared_ptr<BlobCacheFileBuffer> buffer) {
+	{ // Use first 2 hex chars from filepath for partitioning
 		std::lock_guard<std::mutex> lock(io_mutexes[partition]);
 		io_queues[partition].emplace(filepath, buffer);
 	}
@@ -218,8 +218,8 @@ void BlobCache::MainIOThreadLoop(idx_t thread_id) {
 		bool has_job = false;
 		{ // Wait for a job or shutdown signal for this thread's queue
 			std::unique_lock<std::mutex> lock(io_mutexes[thread_id]);
-			io_cvs[thread_id].wait(
-			    lock, [this, thread_id] { return !io_queues[thread_id].empty() || shutdown_io_threads; });
+			io_cvs[thread_id].wait(lock,
+			                       [this, thread_id] { return !io_queues[thread_id].empty() || shutdown_io_threads; });
 
 			if (shutdown_io_threads && io_queues[thread_id].empty()) {
 				break;
@@ -570,7 +570,7 @@ bool BlobCache::EvictToCapacity(idx_t extra_bytes, const string &exclude_filenam
 	auto result = true;
 	if (largerange_blobcache->current_size + extra_bytes > large_capacity) {
 		if (!largerange_blobcache->EvictToCapacity(largerange_blobcache->current_size + extra_bytes - large_capacity,
-		                                  BlobCacheType::LARGE_RANGE, exclude_filename)) {
+		                                           BlobCacheType::LARGE_RANGE, exclude_filename)) {
 			result = false;
 		} else {
 			extra_bytes = 0;
@@ -581,7 +581,7 @@ bool BlobCache::EvictToCapacity(idx_t extra_bytes, const string &exclude_filenam
 	if (smallrange_blobcache->current_size + extra_bytes > small_capacity) {
 		result &=
 		    smallrange_blobcache->EvictToCapacity(smallrange_blobcache->current_size + extra_bytes - small_capacity,
-		                                       BlobCacheType::SMALL_RANGE, exclude_filename);
+		                                          BlobCacheType::SMALL_RANGE, exclude_filename);
 	}
 	return result;
 }
@@ -590,8 +590,7 @@ bool BlobCache::EvictToCapacity(idx_t extra_bytes, const string &exclude_filenam
 // BlobCache (re-) configuration
 //===----------------------------------------------------------------------===//
 
-void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx_t io_threads,
-                               idx_t small_threshold) {
+void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx_t io_threads, idx_t small_threshold) {
 	std::lock_guard<std::mutex> lock(blobcache_mutex);
 	auto directory = base_dir + (StringUtil::EndsWith(base_dir, config.path_sep) ? "" : config.path_sep);
 	if (!config.blobcache_initialized) {
@@ -628,12 +627,11 @@ void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx
 	}
 
 	// Stop existing threads if we need to change thread count or directory
-	config.LogDebug(
-	    "Configuring cache: old_dir='" + config.blobcache_dir + "' new_dir='" + directory +
-	    "' old_size=" + std::to_string(config.total_cache_capacity) + " new_size=" + std::to_string(max_size_bytes) +
-	    " old_threads=" + std::to_string(num_io_threads) + " new_threads=" + std::to_string(io_threads) +
-	    " old_threshold=" + std::to_string(config.small_range_threshold) +
-	    " new_threshold=" + std::to_string(small_threshold));
+	config.LogDebug("Configuring cache: old_dir='" + config.blobcache_dir + "' new_dir='" + directory + "' old_size=" +
+	                std::to_string(config.total_cache_capacity) + " new_size=" + std::to_string(max_size_bytes) +
+	                " old_threads=" + std::to_string(num_io_threads) + " new_threads=" + std::to_string(io_threads) +
+	                " old_threshold=" + std::to_string(config.small_range_threshold) +
+	                " new_threshold=" + std::to_string(small_threshold));
 	if (num_io_threads > 0 && (need_restart_threads || directory_changed)) {
 		config.LogDebug("Stopping existing cache IO threads for reconfiguration");
 		StopIOThreads();
@@ -666,9 +664,8 @@ void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx
 	if (need_restart_threads || directory_changed) {
 		StartIOThreads(io_threads);
 	}
-	config.LogDebug("Cache configuration complete: directory='" + config.blobcache_dir +
-	                "' max_size=" + std::to_string(config.total_cache_capacity) +
-	                " bytes io_threads=" + std::to_string(io_threads) +
+	config.LogDebug("Cache configuration complete: directory='" + config.blobcache_dir + "' max_size=" +
+	                std::to_string(config.total_cache_capacity) + " bytes io_threads=" + std::to_string(io_threads) +
 	                " small_threshold=" + std::to_string(config.small_range_threshold));
 }
 
