@@ -34,40 +34,68 @@ idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename, 
 	    (max_nr_bytes <= config.small_range_threshold) ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
 	BlobCacheMap &blobcache = GetCacheMap(blobcache_type);
 
-	std::unique_lock<std::mutex> lock(blobcache_mutex); // lock caches
-
-	BlobCacheFile *blobcache_file = blobcache.FindFile(cache_key, filename);
-	if (!blobcache_file) {
-		return 0; // nothing cached for this file
+	idx_t hit_size =
+	    ReadFromCacheInternal(blobcache, blobcache_type, cache_key, filename, position, buffer, max_nr_bytes);
+	if (hit_size == 0 && blobcache_type == BlobCacheType::SMALL_RANGE) {
+		// Small cache miss - try large cache as fallback
+		return TryLargeCacheFallback(cache_key, filename, position, buffer, max_nr_bytes);
 	}
-	blobcache.TouchLRU(blobcache_file);
+	return hit_size;
+}
+
+// Fallback: try large cache when small cache misses, duplicate to small cache if found
+idx_t BlobCache::TryLargeCacheFallback(const string &cache_key, const string &filename, idx_t position, void *buffer,
+                                       idx_t &max_nr_bytes) {
+	BlobCacheMap &large_cache = *largerange_blobcache;
+	idx_t hit_size = ReadFromCacheInternal(large_cache, BlobCacheType::LARGE_RANGE, cache_key, filename, position,
+	                                       buffer, max_nr_bytes);
+
+	// Successfully read from large cache - now duplicate to small cache for better retention
+	if (hit_size > 0) {
+		DuplicateRangeToSmallCache(cache_key, filename, position, buffer, hit_size);
+	}
+
+	return hit_size;
+}
+
+// Internal helper: read from cache (common logic for ReadFromCache and TryLargeCacheFallback)
+idx_t BlobCache::ReadFromCacheInternal(BlobCacheMap &cache, BlobCacheType cache_type, const string &cache_key,
+                                       const string &filename, idx_t position, void *buffer, idx_t &max_nr_bytes) {
+	std::unique_lock<std::mutex> lock(blobcache_mutex);
+
+	BlobCacheFile *blobcache_file = cache.FindFile(cache_key, filename);
+	if (!blobcache_file) {
+		return 0; // Nothing cached for this file
+	}
+	cache.TouchLRU(blobcache_file);
 	auto hit_range = AnalyzeRange(blobcache_file->ranges, position, max_nr_bytes);
 	if (!hit_range) {
-		return 0; // some data is cached, but there is no overlapping range
+		return 0; // No overlapping range
 	}
+
 	idx_t hit_size = std::min(max_nr_bytes, hit_range->range_end - position);
 	idx_t offset = position - hit_range->range_start;
 	hit_range->bytes_from_cache += hit_size;
 	hit_range->usage_count++;
 
-	// CRITICAL: Copy everything we need before unlocking
+	// Copy data needed before unlocking
 	idx_t cached_blobcache_range_start = hit_range->blobcache_range_start;
 	auto file_id = blobcache_file->file_id;
-	idx_t saved_range_start = hit_range->range_start; // Save range start to relocate it after reacquiring lock
-	lock.unlock(); // do the longer-running things unlocked (note: blobcache_file might get deleted!)
+	idx_t saved_range_start = hit_range->range_start;
+	lock.unlock();
 
-	// Always read via ReadFromCacheFile, which tries memcache first, then disk
+	// Read from cache file
 	idx_t bytes_from_mem = 0;
-	string blobcache_filepath = config.GenCacheFilePath(file_id, cache_key, blobcache_type);
-	if (!blobcache.ReadFromCacheFile(blobcache_filepath, cached_blobcache_range_start + offset, buffer, hit_size,
-	                                 bytes_from_mem)) { // hit_size may be reduced even on success
-		hit_size = 0; // read from cached file failed! -- can be legal as it could have been deleted by eviction
+	string blobcache_filepath = config.GenCacheFilePath(file_id, cache_key, cache_type);
+	if (!cache.ReadFromCacheFile(blobcache_filepath, cached_blobcache_range_start + offset, buffer, hit_size,
+	                             bytes_from_mem)) {
+		return 0; // Read failed
 	}
 
-	// If we had a memory blobcache hit, update the bytes_from_mem counter
+	// Update bytes_from_mem counter if we had a memory hit
 	if (bytes_from_mem > 0) {
-		lock.lock(); // Reacquire lock and update range's bytes_from_mem counter (handle eviction race)
-		blobcache_file = blobcache.FindFile(cache_key, filename);
+		lock.lock();
+		blobcache_file = cache.FindFile(cache_key, filename);
 		if (blobcache_file && blobcache_file->file_id == file_id) {
 			auto range_it = blobcache_file->ranges.find(saved_range_start);
 			if (range_it != blobcache_file->ranges.end()) {
@@ -76,7 +104,8 @@ idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename, 
 		}
 		lock.unlock();
 	}
-	return hit_size; // No blobcache hit, return 0 to indicate wrapped_fs should be used
+
+	return hit_size;
 }
 
 // we had to read from the original source (e.g. S3). Now try to cache this buffer in the disk-based blobcache
@@ -109,37 +138,82 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 		return; // back off, do not cache this range
 	}
 
+	// Call common insertion logic
+	InsertRangeInternal(blobcache, blobcache_type, blobcache_file, cache_key, filename, range_start_pos, range_end_pos,
+	                    buffer, offset);
+}
+
+// Duplicate a range from large cache to small cache (for better retention of small ranges)
+void BlobCache::DuplicateRangeToSmallCache(const string &cache_key, const string &filename, idx_t position,
+                                           void *buffer, idx_t length) {
+	if (!config.blobcache_initialized || length == 0 || length > config.small_range_threshold) {
+		return; // Only duplicate small ranges
+	}
+
+	BlobCacheMap &small_cache = *smallrange_blobcache;
+	std::lock_guard<std::mutex> lock(blobcache_mutex);
+
+	auto blobcache_file = small_cache.UpsertFile(cache_key, filename);
+	if (!blobcache_file) {
+		return; // Name collision
+	}
+
+	// Check if range already exists in small cache
+	auto hit_range = AnalyzeRange(blobcache_file->ranges, position, length);
+	if (hit_range) {
+		return; // Already cached in small cache, no need to duplicate
+	}
+
+	// Check capacity and evict if needed
+	if (!EvictToCapacity(length, filename)) {
+		return; // Cannot make space
+	}
+
+	// Call common insertion logic
+	InsertRangeInternal(small_cache, BlobCacheType::SMALL_RANGE, blobcache_file, cache_key, filename, position,
+	                    position + length, buffer, 0);
+
+	config.LogDebug("DuplicateRangeToSmallCache: duplicated " + to_string(length) +
+	                " bytes from large cache to small cache for '" + filename + "' at position " + to_string(position));
+}
+
+// Internal helper: insert a range into cache (common logic for InsertCache and DuplicateRangeToSmallCache)
+void BlobCache::InsertRangeInternal(BlobCacheMap &cache, BlobCacheType cache_type, BlobCacheFile *cache_file,
+                                    const string &cache_key, const string &filename, idx_t range_start, idx_t range_end,
+                                    const void *buffer, idx_t buffer_offset) {
+	idx_t actual_bytes = range_end - range_start;
+
 	// Create new range and update stats
-	auto new_range = make_uniq<BlobCacheFileRange>(range_start_pos, range_end_pos);
-	BlobCacheFileRange *range_ptr = new_range.get(); // Get pointer before moving
-	blobcache_file->ranges[range_start_pos] = std::move(new_range);
-	blobcache_file->cached_file_size += actual_bytes;
-	blobcache.current_size += actual_bytes;
-	blobcache.num_ranges++;
+	auto new_range = make_uniq<BlobCacheFileRange>(range_start, range_end);
+	BlobCacheFileRange *range_ptr = new_range.get();
+	cache_file->ranges[range_start] = std::move(new_range);
+	cache_file->cached_file_size += actual_bytes;
+	cache.current_size += actual_bytes;
+	cache.num_ranges++;
 
 	// Pre-compute blobcache_range_start (we append sequentially, so we know the offset in advance)
-	range_ptr->blobcache_range_start = blobcache_file->current_blobcache_file_offset;
-	blobcache_file->current_blobcache_file_offset += actual_bytes; // Update for next write
+	range_ptr->blobcache_range_start = cache_file->current_blobcache_file_offset;
+	cache_file->current_blobcache_file_offset += actual_bytes;
 
 	// Generate blobcache filepath
-	string blobcache_filepath = config.GenCacheFilePath(blobcache_file->file_id, cache_key, blobcache_type);
+	string blobcache_filepath = config.GenCacheFilePath(cache_file->file_id, cache_key, cache_type);
 
-	// Allocate from BufferManager (for memory caching) and copy data outside lock
+	// Allocate from BufferManager (for memory caching) and copy data
 	auto &buffer_manager = blobfile_memcache->GetBufferManager();
 	auto buffer_handle = buffer_manager.Allocate(MemoryTag::EXTERNAL_FILE_CACHE, actual_bytes);
-	std::memcpy(buffer_handle.Ptr(), static_cast<const char *>(buffer) + offset, actual_bytes);
+	std::memcpy(buffer_handle.Ptr(), static_cast<const char *>(buffer) + buffer_offset, actual_bytes);
 
-	// Now register this cached piece of blobcache file in the memcache (even though it is not written yet)
+	// Register this cached piece in the memcache
 	InsertRangeIntoMemcache(blobcache_filepath, range_ptr->blobcache_range_start, buffer_handle, actual_bytes);
 
-	// schedule the writing of this new ranfe
+	// Schedule the disk write
 	auto file_buffer =
 	    duckdb::make_shared_ptr<BlobCacheFileBuffer>(std::move(buffer_handle), actual_bytes, cache_key, filename);
-	file_buffer->disk_write_completed_ptr = &range_ptr->disk_write_completed; // Set backpointer for write completion
-	range_ptr->memcache_buffer = file_buffer;                                 // Store buffer for memory blobcache hits
-	string hex_prefix = cache_key.substr(4, 2); // the first 4 hex is the dir, take the next 2 for the partition
+	file_buffer->disk_write_completed_ptr = &range_ptr->disk_write_completed;
+	range_ptr->memcache_buffer = file_buffer;
+	string hex_prefix = cache_key.substr(4, 2);
 	idx_t partition = std::stoul(hex_prefix, nullptr, 16) % num_io_threads;
-	QueueIOWrite(blobcache_filepath, partition, file_buffer); // writing to disk is done by background threads
+	QueueIOWrite(blobcache_filepath, partition, file_buffer);
 }
 
 //===----------------------------------------------------------------------===//
@@ -280,6 +354,9 @@ void BlobCache::MainIOThreadLoop(idx_t thread_id) {
 		                           blobcache_range_start)) {
 			// Mark disk write as completed via backpointer
 			file_buffer->disk_write_completed_ptr->store(true, std::memory_order_release);
+			// Unpin the buffer now that write is complete - allows buffer manager to evict if needed
+			// The ExternalFileCache can re-pin it via the block_handle when needed
+			file_buffer->Unpin();
 			config.LogDebug("MainIOThreadLoop " + std::to_string(thread_id) + " completed write '" + filepath + "'");
 		} else {
 			// Write failed - log error (memcache has stale data, but eviction is unsafe from background thread)
@@ -304,7 +381,8 @@ bool BlobCacheMap::EvictToCapacity(idx_t required_space, BlobCacheType cache_typ
 	while (required_space > freed_space && lru_tail && lru_tail != file_to_evict) {
 		file_to_evict = lru_tail;
 		size_t file_space = (file_to_evict->filename == exclude_filename)
-		                         ? 0 : EvictCacheKey(config.GenCacheKey(file_to_evict->filename), cache_type);
+		                        ? 0
+		                        : EvictCacheKey(config.GenCacheKey(file_to_evict->filename), cache_type);
 		if (file_space == 0) {
 			config.LogDebug("EvictToCapacity: could not evict '" + exclude_filename + "'");
 			TouchLRU(file_to_evict); // Move it to front of LRU so we try something else

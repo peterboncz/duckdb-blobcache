@@ -54,6 +54,11 @@ struct BlobCacheFileBuffer {
 	    : buffer_handle(std::move(handle)), size(buffer_size), disk_write_completed_ptr(nullptr),
 	      cache_key(std::move(key)), filename(std::move(fname)) {
 	}
+
+	// Unpin the buffer after write completes to allow buffer manager to evict if needed
+	void Unpin() {
+		buffer_handle.Destroy();
+	}
 };
 
 //===----------------------------------------------------------------------===//
@@ -295,6 +300,19 @@ struct BlobCache {
 	void InsertCache(const string &cache_key, const string &filename, idx_t start_pos, void *buf, idx_t len);
 	// Combined cache lookup and read - returns bytes read from cache, adjusts nr_bytes if needed
 	idx_t ReadFromCache(const string &cache_key, const string &filename, idx_t position, void *buf, idx_t &len);
+	// Fallback: try large cache when small cache misses, duplicate to small cache if found
+	idx_t TryLargeCacheFallback(const string &cache_key, const string &filename, idx_t position, void *buf,
+	                            idx_t &max_nr_bytes);
+	// Duplicate a range from large cache to small cache (for better retention)
+	void DuplicateRangeToSmallCache(const string &cache_key, const string &filename, idx_t position, void *buffer,
+	                                idx_t length);
+	// Internal helper: insert a range into cache (common logic for InsertCache and DuplicateRangeToSmallCache)
+	void InsertRangeInternal(BlobCacheMap &cache, BlobCacheType cache_type, BlobCacheFile *cache_file,
+	                         const string &cache_key, const string &filename, idx_t range_start, idx_t range_end,
+	                         const void *buffer, idx_t buffer_offset);
+	// Internal helper: read from cache (common logic for ReadFromCache and TryLargeCacheFallback)
+	idx_t ReadFromCacheInternal(BlobCacheMap &cache, BlobCacheType cache_type, const string &cache_key,
+	                            const string &filename, idx_t position, void *buffer, idx_t &max_nr_bytes);
 	bool EvictToCapacity(idx_t extra_bytes = 0, const string &exclude_filename = "");
 
 	void ConfigureCache(const string &directory, idx_t max_size_bytes = BlobCacheConfig::DEFAULT_CACHE_CAPACITY,
