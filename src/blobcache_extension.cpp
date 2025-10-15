@@ -286,6 +286,114 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 }
 
 //===----------------------------------------------------------------------===//
+// blobcache_prefetch - Scalar function to prefetch ranges into cache
+//===----------------------------------------------------------------------===//
+
+struct PrefetchRange {
+	idx_t start;
+	idx_t end;
+	idx_t original_size; // Sum of original range sizes
+};
+
+static void BlobCachePrefetchFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	auto &db = *context.db;
+	auto cache = GetOrCreateBlobCache(db);
+
+	if (!cache->config.blobcache_initialized) {
+		// Cache not initialized - mark all as failed
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+		ConstantVector::SetNull(result, true);
+		return;
+	}
+
+	auto &filename_vec = args.data[0];
+	auto &start_vec = args.data[1];
+	auto &size_vec = args.data[2];
+	auto count = args.size();
+
+	// Flatten vectors to process them
+	UnifiedVectorFormat filename_data, start_data, size_data;
+	filename_vec.ToUnifiedFormat(count, filename_data);
+	start_vec.ToUnifiedFormat(count, start_data);
+	size_vec.ToUnifiedFormat(count, size_data);
+
+	auto filename_ptr = UnifiedVectorFormat::GetData<string_t>(filename_data);
+	auto start_ptr = UnifiedVectorFormat::GetData<int64_t>(start_data);
+	auto size_ptr = UnifiedVectorFormat::GetData<int64_t>(size_data);
+
+	// Group ranges by filename and concatenate nearby ranges
+	unordered_map<string, vector<PrefetchRange>> ranges_by_file;
+
+	for (idx_t i = 0; i < count; i++) {
+		auto filename_idx = filename_data.sel->get_index(i);
+		auto start_idx = start_data.sel->get_index(i);
+		auto size_idx = size_data.sel->get_index(i);
+
+		if (!filename_data.validity.RowIsValid(filename_idx) || !start_data.validity.RowIsValid(start_idx) ||
+		    !size_data.validity.RowIsValid(size_idx)) {
+			continue; // Skip null rows
+		}
+
+		string filename = filename_ptr[filename_idx].GetString();
+		idx_t range_start = start_ptr[start_idx];
+		idx_t range_size = size_ptr[size_idx];
+
+		if (range_size == 0) {
+			continue;
+		}
+
+		auto &ranges = ranges_by_file[filename];
+		PrefetchRange new_range = {range_start, range_start + range_size, range_size};
+
+		// Try to concatenate with the last range
+		if (!ranges.empty()) {
+			auto &last = ranges.back();
+			idx_t concatenated_size = new_range.end - last.start;
+			idx_t original_sum = last.original_size + new_range.original_size;
+
+			// Concatenate if concatenated_size < 2x the sum of original sizes
+			if (concatenated_size < 2 * original_sum) {
+				last.end = new_range.end;
+				last.original_size = original_sum;
+				continue;
+			}
+		}
+		ranges.push_back(new_range);
+	}
+
+	// Prefetch all concatenated ranges by directly reading and inserting into cache
+	auto &fs = FileSystem::GetFileSystem(db);
+	for (auto &entry : ranges_by_file) {
+		const string &filename = entry.first;
+		auto &ranges = entry.second;
+
+		try {
+			// Open file for reading
+			auto handle = fs.OpenFile(filename, FileOpenFlags::FILE_FLAGS_READ);
+			string cache_key = cache->config.GenCacheKey(filename);
+
+			for (auto &range : ranges) {
+				idx_t bytes_to_read = range.end - range.start;
+				auto buffer = unique_ptr<char[]>(new char[bytes_to_read]);
+
+				// Read data from file
+				fs.Read(*handle, buffer.get(), bytes_to_read, range.start);
+
+				// Directly insert into cache (bypass wrapper check)
+				cache->InsertCache(cache_key, filename, range.start, buffer.get(), bytes_to_read);
+			}
+		} catch (...) {
+			// Ignore errors for individual files
+		}
+	}
+
+	// Return true for all rows
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::GetData<bool>(result)[0] = true;
+}
+
+//===----------------------------------------------------------------------===//
 // BlobCacheExtensionCallback - Automatic wrapping when target extensions load
 //===----------------------------------------------------------------------===//
 class BlobCacheExtensionCallback : public ExtensionCallback {
@@ -330,6 +438,13 @@ void BlobcacheExtension::Load(ExtensionLoader &loader) {
 	blobcache_stats_function.init_global = BlobCacheStatsInitGlobal;
 	loader.RegisterFunction(blobcache_stats_function);
 	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Registered blobcache_stats function");
+
+	// Register blobcache_prefetch scalar function
+	ScalarFunction blobcache_prefetch_function("blobcache_prefetch",
+	                                           {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
+	                                           LogicalType::BOOLEAN, BlobCachePrefetchFunction);
+	loader.RegisterFunction(blobcache_prefetch_function);
+	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Registered blobcache_prefetch function");
 
 	/// create an initial cache
 	auto shared_cache = GetOrCreateBlobCache(instance);
