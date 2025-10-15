@@ -231,6 +231,7 @@ struct BlobCache {
 	static constexpr idx_t MAX_IO_THREADS = 256;
 
 	BlobCacheConfig config; // owns cache configuration settings
+	idx_t file_handle_id = 0;
 
 	// Cache maps for small and large ranges
 	mutable std::mutex blobcache_mutex; // Protects both caches, LRU lists, sizes

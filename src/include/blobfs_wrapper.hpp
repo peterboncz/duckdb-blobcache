@@ -46,6 +46,7 @@ public:
 	    : FileHandle(fs, wrapped_handle->GetPath(), wrapped_handle->GetFlags()),
 	      wrapped_handle(std::move(wrapped_handle)), cache_key(std::move(cache_key)), cache(cache),
 	      original_path(std::move(original_path)), file_position(0) {
+		file_handle_id = cache->file_handle_id++; // TODO: should be an atomic increment
 	}
 
 	~BlobFileHandle() override = default;
@@ -62,6 +63,7 @@ public:
 	shared_ptr<BlobCache> cache;
 	string original_path; // Store original path with protocol prefix
 	idx_t file_position;  // Track our own file position
+	idx_t file_handle_id;
 };
 
 //===----------------------------------------------------------------------===//

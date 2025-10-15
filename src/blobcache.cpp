@@ -8,9 +8,11 @@ namespace duckdb {
 
 static BlobCacheFileRange *AnalyzeRange(map<idx_t, unique_ptr<BlobCacheFileRange>> &ranges, idx_t position,
                                         idx_t &max_nr_bytes) {
+	if (ranges.empty()) {
+		return nullptr;
+	}
 	auto it = ranges.upper_bound(position);
 	BlobCacheFileRange *hit_range = nullptr;
-
 	if (it != ranges.begin()) { // is there a range that starts <= start_pos?
 		auto &prev_range = std::prev(it)->second;
 		if (prev_range->range_end > position) { // it covers the start of this range
@@ -151,7 +153,7 @@ void BlobCache::InsertRangeIntoMemcache(const string &blobcache_filepath, idx_t 
 	                                                                          blobcache_range_start, "");
 	auto lock_guard = memcache_file.lock.GetExclusiveLock();
 	memcache_file.Ranges(lock_guard)[blobcache_range_start] = memcache_range;
-	config.LogDebug("Inserted into memcache: '" + blobcache_filepath + "' at offset " +
+	config.LogDebug("InsertRangeIntoMemcache: inserted into memcache: '" + blobcache_filepath + "' at offset " +
 	                std::to_string(blobcache_range_start) + " length " + std::to_string(length));
 }
 
@@ -165,16 +167,19 @@ bool BlobCache::TryReadFromMemcache(const string &blobcache_filepath, idx_t blob
 	auto memcache_ranges_guard = memcache_file.lock.GetSharedLock();
 	auto &memcache_ranges = memcache_file.Ranges(memcache_ranges_guard);
 	auto it = memcache_ranges.find(blobcache_range_start);
-	auto &memcache_range = *it->second;
-	if (it == memcache_ranges.end() || memcache_range.nr_bytes == 0) {
-		return false; // mem-cached range not found or empty
+	if (it == memcache_ranges.end()) {
+		return false; // Range not found in memory cache
 	}
-	config.LogDebug("Memory cache hit for " + to_string(length) + " bytes in '" + blobcache_filepath + "',  offset " +
-	                to_string(blobcache_range_start) + " with length " + to_string(memcache_range.nr_bytes));
+	auto &memcache_range = *it->second;
+	if (memcache_range.nr_bytes == 0) {
+		return false; // Empty range
+	}
+	config.LogDebug("TryReadFromMemcache: memcache hit for " + to_string(length) + " bytes in '" + blobcache_filepath +
+	                "',  offset " + to_string(blobcache_range_start) + " length " + to_string(memcache_range.nr_bytes));
 	auto &buffer_manager = blobfile_memcache->GetBufferManager();
 	auto pin = buffer_manager.Pin(memcache_range.block_handle);
-	if (!pin.IsValid()) { // Try to pin the block handle
-		config.LogDebug("Pinning cache hit failed -- apparently there is high memory pressure");
+	if (!pin.IsValid()) {
+		config.LogDebug("TryReadFromMemcache: pinning cache hit failed -- apparently there is high memory pressure");
 		return false;
 	}
 	if (memcache_range.nr_bytes < length) {
@@ -199,12 +204,12 @@ void BlobCache::QueueIOWrite(const string &filepath, idx_t partition, duckdb::sh
 void BlobCache::StartIOThreads(idx_t thread_count) {
 	if (thread_count > MAX_IO_THREADS) {
 		thread_count = MAX_IO_THREADS;
-		config.LogDebug("Limiting IO threads to maximum allowed: " + std::to_string(MAX_IO_THREADS));
+		config.LogDebug("StartIOThreads: limiting IO threads to maximum allowed: " + std::to_string(MAX_IO_THREADS));
 	}
 	shutdown_io_threads = false;
 	num_io_threads = thread_count;
 
-	config.LogDebug("Starting " + std::to_string(num_io_threads) + " blobcache IO threads");
+	config.LogDebug("StartIOThreads: starting " + std::to_string(num_io_threads) + " blobcache IO threads");
 
 	for (idx_t i = 0; i < num_io_threads; i++) {
 		io_threads[i] = std::thread([this, i] { MainIOThreadLoop(i); });
@@ -233,13 +238,13 @@ void BlobCache::StopIOThreads() {
 	}
 	// Only log if not shutting down
 	if (!config.blobcache_shutting_down) {
-		config.LogDebug("Stopped " + std::to_string(num_io_threads) + " cache writer threads");
+		config.LogDebug("StopIOThreads: stopped " + std::to_string(num_io_threads) + " cache writer threads");
 	}
 	num_io_threads = 0; // Reset thread count
 }
 
 void BlobCache::MainIOThreadLoop(idx_t thread_id) {
-	config.LogDebug("Cache writer thread " + std::to_string(thread_id) + " started");
+	config.LogDebug("MainIOThreadLoop " + std::to_string(thread_id) + " started");
 	while (!shutdown_io_threads) {
 		pair<string, duckdb::shared_ptr<BlobCacheFileBuffer>> job;
 		bool has_job = false;
@@ -261,31 +266,29 @@ void BlobCache::MainIOThreadLoop(idx_t thread_id) {
 			continue;
 		}
 		// Process the cache write job
-		const string &blobcache_filepath = job.first;
+		const string &filepath = job.first;
 		auto file_buffer = job.second;
 
 		// Determine cache type from filename: /cachedir/1234/567890ABCDEFsID:FILE:PROT -> 's' means SMALL_RANGE
-		size_t last_sep = blobcache_filepath.find_last_of(config.path_sep);
-		char type_char = blobcache_filepath[last_sep + 12 + 1]; // after / there are 12 hex chars and then 's' or 'l'
+		size_t last_sep = filepath.find_last_of(config.path_sep);
+		char type_char = filepath[last_sep + 12 + 1]; // after / there are 12 hex chars and then 's' or 'l'
 		BlobCacheType cache_type = (type_char == 's') ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
 		BlobCacheMap &cache = GetCacheMap(cache_type);
 
 		idx_t blobcache_range_start;
-		if (cache.WriteToCacheFile(blobcache_filepath, file_buffer->buffer_handle.Ptr(), file_buffer->size,
+		if (cache.WriteToCacheFile(filepath, file_buffer->buffer_handle.Ptr(), file_buffer->size,
 		                           blobcache_range_start)) {
 			// Mark disk write as completed via backpointer
-			if (file_buffer->disk_write_completed_ptr) {
-				file_buffer->disk_write_completed_ptr->store(true, std::memory_order_release);
-			}
-			config.LogDebug("Background writer completed write for blobcache_filepath '" + blobcache_filepath + "'");
+			file_buffer->disk_write_completed_ptr->store(true, std::memory_order_release);
+			config.LogDebug("MainIOThreadLoop " + std::to_string(thread_id) + " completed write '" + filepath + "'");
 		} else {
 			// Write failed - log error (memcache has stale data, but eviction is unsafe from background thread)
-			config.LogError("Failed to write to blobcache file '" + blobcache_filepath + "'");
+			config.LogError("MainIOThreadLoop " + std::to_string(thread_id) + " failed to write  '" + filepath + "'");
 		}
 	}
 	// Only log thread shutdown if not during database shutdown to avoid access to destroyed instance
 	if (!config.blobcache_shutting_down) {
-		config.LogDebug("Cache writer thread " + std::to_string(thread_id) + " stopped");
+		config.LogDebug("MainIOThreadLoop " + std::to_string(thread_id) + " stopped");
 	}
 }
 
@@ -294,22 +297,23 @@ void BlobCache::MainIOThreadLoop(idx_t thread_id) {
 //===----------------------------------------------------------------------===//
 
 bool BlobCacheMap::EvictToCapacity(idx_t required_space, BlobCacheType cache_type, const string &exclude_filename) {
-	// Try to evict files to make space, returns true if successful
-	// Skip files with unfinished writes and the exclude_key
+	// Try to evict files to make space (for a new range in exclude_filename), returns true if successful
 	// Note: This is called with blobcache_mutex already held
 	idx_t freed_space = 0;
 	BlobCacheFile *file_to_evict = nullptr;
 	while (required_space > freed_space && lru_tail && lru_tail != file_to_evict) {
 		file_to_evict = lru_tail;
-		if (file_to_evict->filename == exclude_filename) {
-			config.LogDebug("Skipping eviction of'" + exclude_filename + "'");
+		size_t file_space = (file_to_evict->filename == exclude_filename)
+		                         ? 0 : EvictCacheKey(config.GenCacheKey(file_to_evict->filename), cache_type);
+		if (file_space == 0) {
+			config.LogDebug("EvictToCapacity: could not evict '" + exclude_filename + "'");
 			TouchLRU(file_to_evict); // Move it to front of LRU so we try something else
 			continue;
 		}
-		freed_space += EvictCacheKey(config.GenCacheKey(file_to_evict->filename), cache_type);
+		freed_space += file_space;
 	}
 	if (freed_space < required_space) {
-		config.LogError("Cannot evict below " + std::to_string(current_size) + " to make room for " +
+		config.LogError("EvictToCapacity: cannot evict below " + std::to_string(current_size) + " to make room for " +
 		                std::to_string(required_space) + " bytes");
 		return false;
 	}
@@ -320,10 +324,14 @@ size_t BlobCacheMap::EvictCacheKey(const string &cache_key, BlobCacheType cache_
 	idx_t evicted_bytes = 0;
 	auto it = key_cache->find(cache_key);
 	if (it == key_cache->end()) {
-		config.LogError("Evictkey:  '" + cache_key + "' -not found");
+		config.LogError("EvictCacheKey:  '" + cache_key + "' -not found");
 		return 0;
 	}
 	for (auto &range : it->second->ranges) {
+		if (!range.second->disk_write_completed.load()) {
+			config.LogDebug("EvictCacheKey:  '" + cache_key + "' is skipped because it has ongoing writes.");
+			return 0;
+		}
 		evicted_bytes += range.second->range_end - range.second->range_start;
 	}
 	// evict - ranges_mutex is locked so no other thread is using this file
@@ -420,11 +428,11 @@ void BlobCacheMap::EnsureSubdirectoryExists(const string &cache_filepath) {
 		auto &fs = config.GetFileSystem();
 		if (!fs.DirectoryExists(subdir_path)) {
 			fs.CreateDirectory(subdir_path);
-			config.LogDebug("Created cache subdirectory '" + subdir_path + "'");
+			config.LogDebug("EnsureSubdirectoryExists: created cache subdirectory '" + subdir_path + "'");
 		}
 		config.subdirs_created[subdir_index] = true;
 	} catch (const std::exception &e) {
-		config.LogError("Failed to create cache subdirectory '" + subdir_path + "': " + string(e.what()));
+		config.LogError("EnsureSubdirectoryExists: failed to mkdir '" + subdir_path + "': " + string(e.what()));
 	}
 }
 
@@ -437,7 +445,7 @@ unique_ptr<FileHandle> BlobCacheMap::TryOpenCacheFile(const string &cache_filepa
 		return fs.OpenFile(cache_filepath, FileOpenFlags::FILE_FLAGS_READ);
 	} catch (const std::exception &e) {
 		// File was evicted between metadata check and open - this is expected
-		config.LogDebug("Cache file not found (likely evicted): '" + cache_filepath + "'");
+		config.LogDebug("TryOpenCacheFile: file not found (likely evicted): '" + cache_filepath + "'");
 		return nullptr;
 	}
 }
@@ -476,7 +484,7 @@ bool BlobCacheMap::WriteToCacheFile(const string &blobcache_filepath, const void
 		    FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE | FileOpenFlags::FILE_FLAGS_APPEND;
 		auto handle = fs.OpenFile(blobcache_filepath, flags);
 		if (!handle) {
-			config.LogError("Failed to open blobcache file for writing: '" + blobcache_filepath + "'");
+			config.LogError("WriteToCacheFile: failed to open: '" + blobcache_filepath + "'");
 			return false;
 		}
 		// Get current file size to know where we're appending
@@ -484,12 +492,12 @@ bool BlobCacheMap::WriteToCacheFile(const string &blobcache_filepath, const void
 		int64_t bytes_written = fs.Write(*handle, const_cast<void *>(buffer), length);
 		handle->Close(); // Close handle explicitly
 		if (bytes_written != static_cast<int64_t>(length)) {
-			config.LogError("Failed to write all bytes to blobcache file (wrote " + std::to_string(bytes_written) +
-			                " of " + std::to_string(length) + ")");
+			config.LogError("WriteToCacheFile: failed to write all bytes to '" + blobcache_filepath + "' (wrote " +
+			                std::to_string(bytes_written) + " of " + std::to_string(length) + ")");
 			return false;
 		}
 	} catch (const std::exception &e) {
-		config.LogError("Failed to write to blobcache file '" + blobcache_filepath + "': " + string(e.what()));
+		config.LogError("WriteToCacheFile: failed to write to '" + blobcache_filepath + "': " + string(e.what()));
 		return false;
 	}
 	return true;
@@ -501,10 +509,10 @@ bool BlobCacheMap::DeleteCacheFile(const string &cache_filepath) {
 	try {
 		auto &fs = config.GetFileSystem();
 		fs.RemoveFile(cache_filepath);
-		config.LogDebug("Deleted cache file '" + cache_filepath + "'");
+		config.LogDebug("DeleteCacheFile: deleted file '" + cache_filepath + "'");
 		return true;
 	} catch (const std::exception &e) {
-		config.LogError("Failed to delete cache file '" + cache_filepath + "': " + string(e.what()));
+		config.LogError("DeleteCacheFile: failed to delete file '" + cache_filepath + "': " + string(e.what()));
 		return false;
 	}
 }
@@ -594,18 +602,18 @@ void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx
 		config.total_cache_capacity = max_size_bytes;
 		config.small_range_threshold = small_threshold;
 
-		config.LogDebug("Initializing cache: directory='" + config.blobcache_dir +
+		config.LogDebug("ConfigureCache: initializing cache: directory='" + config.blobcache_dir +
 		                "' max_size=" + std::to_string(config.total_cache_capacity) +
 		                " bytes io_threads=" + std::to_string(max_io_threads) +
 		                " small_threshold=" + std::to_string(config.small_range_threshold));
 		if (!config.InitCacheDir()) {
-			config.LogError("Initializing cache directory='" + config.blobcache_dir + "' failed");
+			config.LogError("ConfigureCache: initializing cache directory='" + config.blobcache_dir + "' failed");
 		}
 		Clear();
 		config.blobcache_initialized = true;
 		// Initialize our own ExternalFileCache instance (always enabled for memory caching)
 		blobfile_memcache = make_uniq<ExternalFileCache>(*config.db_instance, true);
-		config.LogDebug("Initialized blobfile_memcache for memory caching of disk-cached files");
+		config.LogDebug("ConfigureCache: initialized blobfile_memcache for memory caching of disk-cached files");
 		StartIOThreads(max_io_threads);
 		return;
 	}
@@ -622,44 +630,44 @@ void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx
 	}
 
 	// Stop existing threads if we need to change thread count or directory
-	config.LogDebug("Configuring cache: old_dir='" + config.blobcache_dir + "' new_dir='" + directory + "' old_size=" +
+	config.LogDebug("ConfigureCache: old_dir='" + config.blobcache_dir + "' new_dir='" + directory + "' old_size=" +
 	                std::to_string(config.total_cache_capacity) + " new_size=" + std::to_string(max_size_bytes) +
 	                " old_threshold=" + std::to_string(config.small_range_threshold) + " new_threshold=" +
 	                std::to_string(small_threshold) + " old_threads=" + std::to_string(num_io_threads) +
 	                " new_threads=" + std::to_string(max_io_threads));
 	if (num_io_threads > 0 && (need_restart_threads || directory_changed)) {
-		config.LogDebug("Stopping existing cache IO threads for reconfiguration");
+		config.LogDebug("ConfigureCache: stopping existing cache IO threads for reconfiguration");
 		StopIOThreads();
 	}
 
 	// Clear existing cache only if directory changed or threshold changed
 	if (directory_changed || threshold_changed) {
-		config.LogDebug("Directory or threshold changed, clearing cache");
+		config.LogDebug("ConfigureCache: directory or threshold changed, clearing cache");
 		Clear();
 		if (directory_changed) {
 			if (!config.CleanCacheDir()) { // Clean old directory before switching
-				config.LogError("Cleaning cache directory='" + config.blobcache_dir + "' failed");
+				config.LogError("ConfigureCache: cleaning cache directory='" + config.blobcache_dir + "' failed");
 			}
 		}
 		config.blobcache_dir = directory;
 		config.small_range_threshold = small_threshold;
 		if (!config.InitCacheDir()) {
-			config.LogError("Initializing cache directory='" + config.blobcache_dir + "' failed");
+			config.LogError("ConfigureCache: initializing cache directory='" + config.blobcache_dir + "' failed");
 		}
 		// Reinitialize blobfile_memcache when directory changes
 		blobfile_memcache = make_uniq<ExternalFileCache>(*config.db_instance, true);
-		config.LogDebug("Reinitialized blobfile_memcache after directory change");
+		config.LogDebug("ConfigureCache: reinitialized blobfile_memcache after directory change");
 	}
 	// Same directory, just update capacity and evict if needed
 	config.total_cache_capacity = max_size_bytes;
 	if (size_reduced && !EvictToCapacity()) {
-		config.LogError("Failed to reduce the directory sizes to the new lower capacity/");
+		config.LogError("ConfigureCache: failed to reduce the directory sizes to the new lower capacity/");
 	}
 	// Start threads if they were stopped or thread count changed
 	if (need_restart_threads || directory_changed) {
 		StartIOThreads(max_io_threads);
 	}
-	config.LogDebug("Cache configuration complete: directory='" + config.blobcache_dir + "' max_size=" +
+	config.LogDebug("ConfigureCache complete: directory='" + config.blobcache_dir + "' max_size=" +
 	                to_string(config.total_cache_capacity) + " bytes io_threads=" + to_string(max_io_threads) +
 	                " small_threshold=" + to_string(config.small_range_threshold));
 }
@@ -674,7 +682,7 @@ void BlobCache::UpdateRegexPatterns(const string &regex_patterns_str) {
 	cached_regexps.clear(); // Clear existing patterns
 	if (regex_patterns_str.empty()) {
 		// Conservative mode: empty regexps
-		config.LogDebug("Updated to conservative mode (empty regex patterns)");
+		config.LogDebug("UpdateRegexPatterns: updated to conservative mode (empty regex patterns)");
 		return;
 	}
 	// Aggressive mode: parse semicolon-separated patterns
@@ -683,13 +691,13 @@ void BlobCache::UpdateRegexPatterns(const string &regex_patterns_str) {
 		if (!pattern_str.empty()) {
 			try {
 				cached_regexps.emplace_back(pattern_str, std::regex_constants::icase);
-				config.LogDebug("Compiled regex pattern: '" + pattern_str + "'");
+				config.LogDebug("UpdateRegexPatterns: compiled regex pattern: '" + pattern_str + "'");
 			} catch (const std::regex_error &e) {
-				config.LogError("Invalid regex pattern '" + pattern_str + "': " + string(e.what()));
+				config.LogError("UpdateRegexPatterns: wrong regex pattern '" + pattern_str + "': " + string(e.what()));
 			}
 		}
 	}
-	config.LogDebug("Updated to aggressive mode with " + std::to_string(cached_regexps.size()) + " regex patterns");
+	config.LogDebug("UpdateRegexPatterns: now using " + std::to_string(cached_regexps.size()) + " regex patterns");
 }
 
 bool BlobCache::ShouldCacheFile(const string &filename, optional_ptr<FileOpener> opener) const {
