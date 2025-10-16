@@ -261,6 +261,19 @@ public:
 		return LocalFileSystem::OpenFile(actual_path, flags, opener);
 	}
 
+	// Override Glob to strip prefix for search, then re-add to results
+	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override {
+		string actual_path = StripDebugPrefix(path);
+		auto results = LocalFileSystem::Glob(actual_path, opener);
+
+		// Re-add debug:// prefix to all returned paths so subsequent reads use debug filesystem
+		for (auto &info : results) {
+			info.path = "debug://" + info.path;
+		}
+
+		return results;
+	}
+
 private:
 	// Helper method to strip debug:// prefix
 	string StripDebugPrefix(const string &path) {

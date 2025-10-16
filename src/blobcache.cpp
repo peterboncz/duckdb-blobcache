@@ -15,14 +15,14 @@ static BlobCacheFileRange *AnalyzeRange(map<idx_t, unique_ptr<BlobCacheFileRange
 	BlobCacheFileRange *hit_range = nullptr;
 	if (it != ranges.begin()) { // is there a range that starts <= start_pos?
 		auto &prev_range = std::prev(it)->second;
-		if (prev_range->range_end > position) { // it covers the start of this range
+		if (prev_range && prev_range->range_end > position) { // it covers the start of this range
 			// Range is usable if: (1) memcache_buffer exists (in ExternalFileCache), OR (2) disk write completed
 			if (prev_range->memcache_buffer || prev_range->disk_write_completed.load(std::memory_order_acquire)) {
 				hit_range = prev_range.get();
 			}
 		}
 	}
-	if (it != ranges.end() && it->second->range_start < position + max_nr_bytes) {
+	if (it != ranges.end() && it->second && it->second->range_start < position + max_nr_bytes) {
 		max_nr_bytes = it->second->range_start - position; // cut short our range because the end is already cached now
 	}
 	return hit_range;
@@ -355,18 +355,21 @@ bool BlobCacheMap::EvictToCapacity(idx_t required_space, BlobCacheType cache_typ
 	// Try to evict files to make space (for a new range in exclude_filename), returns true if successful
 	// Note: This is called with blobcache_mutex already held
 	idx_t freed_space = 0;
-	BlobCacheFile *file_to_evict = nullptr;
-	while (required_space > freed_space && lru_tail && lru_tail != file_to_evict) {
-		file_to_evict = lru_tail;
+	BlobCacheFile *last_attempted_evict = nullptr;
+	while (required_space > freed_space && lru_tail && lru_tail != last_attempted_evict) {
+		auto *file_to_evict = lru_tail;
 		size_t file_space = (file_to_evict->filename == exclude_filename)
 		                        ? 0
 		                        : EvictCacheKey(config.GenCacheKey(file_to_evict->filename), cache_type);
 		if (file_space == 0) {
 			config.LogDebug("EvictToCapacity: could not evict '" + exclude_filename + "'");
 			TouchLRU(file_to_evict); // Move it to front of LRU so we try something else
+			last_attempted_evict = file_to_evict;
 			continue;
 		}
+		// file_to_evict is now freed - do not reference it again
 		freed_space += file_space;
+		last_attempted_evict = nullptr; // Reset since we made progress
 	}
 	if (freed_space < required_space) {
 		config.LogError("EvictToCapacity: cannot evict below " + std::to_string(current_size) + " to make room for " +
@@ -524,8 +527,16 @@ bool BlobCacheMap::ReadFromCacheFile(const string &blobcache_filepath, idx_t blo
 		return false; // allocation failed
 	}
 	auto buffer_ptr = buffer_handle.Ptr();
-	config.GetFileSystem().Read(*handle, buffer_ptr, length, blobcache_range_start); // Read from disk into buffer
-	std::memcpy(buffer, buffer_ptr, length);                                         // Copy to output buffer
+	try {
+		config.GetFileSystem().Read(*handle, buffer_ptr, length, blobcache_range_start); // Read from disk into buffer
+	} catch (const std::exception &e) {
+		// File was evicted/deleted after opening but before reading - signal cache miss to fall back to original source
+		buffer_handle.Destroy();
+		config.LogDebug("ReadFromCacheFile: read failed (likely evicted during read): '" + blobcache_filepath +
+		                "': " + string(e.what()));
+		return false;
+	}
+	std::memcpy(buffer, buffer_ptr, length); // Copy to output buffer
 	config.parent_cache->InsertRangeIntoMemcache(blobcache_filepath, blobcache_range_start, buffer_handle, length);
 	return true;
 }
