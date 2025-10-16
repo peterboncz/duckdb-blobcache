@@ -65,6 +65,12 @@ struct BlobCacheFileBuffer {
 struct BlobCacheWriteJob {
 	string filepath;                                // Cache file path to write to
 	duckdb::shared_ptr<BlobCacheFileBuffer> buffer; // Buffer containing data to write
+
+	BlobCacheWriteJob() {
+	}
+	BlobCacheWriteJob(string path, duckdb::shared_ptr<BlobCacheFileBuffer> buf)
+	    : filepath(std::move(path)), buffer(std::move(buf)) {
+	}
 };
 
 // BlobCacheReadJob - async read job for prefetching
@@ -73,6 +79,12 @@ struct BlobCacheReadJob {
 	string cache_key;  // Cache key for insertion
 	idx_t range_start; // Start position in file
 	idx_t range_size;  // Bytes to read
+
+	BlobCacheReadJob() : range_start(0), range_size(0) {
+	}
+	BlobCacheReadJob(string fname, string key, idx_t start, idx_t size)
+	    : filename(std::move(fname)), cache_key(std::move(key)), range_start(start), range_size(size) {
+	}
 };
 
 //===----------------------------------------------------------------------===//

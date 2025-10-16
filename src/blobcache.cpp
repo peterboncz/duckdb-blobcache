@@ -220,7 +220,7 @@ bool BlobCache::TryReadFromMemcache(const string &blobcache_filepath, idx_t blob
 void BlobCache::QueueIOWrite(const string &filepath, idx_t partition, duckdb::shared_ptr<BlobCacheFileBuffer> buffer) {
 	{
 		std::lock_guard<std::mutex> lock(io_mutexes[partition]);
-		write_queues[partition].emplace(BlobCacheWriteJob {filepath, buffer});
+		write_queues[partition].emplace(filepath, buffer);
 	}
 	io_cvs[partition].notify_one();
 }
@@ -230,7 +230,7 @@ void BlobCache::QueueIORead(const string &filename, const string &cache_key, idx
 	idx_t target_thread = read_job_counter.fetch_add(1, std::memory_order_relaxed) % num_io_threads;
 	{
 		std::lock_guard<std::mutex> lock(io_mutexes[target_thread]);
-		read_queues[target_thread].emplace(BlobCacheReadJob {filename, cache_key, range_start, range_size});
+		read_queues[target_thread].emplace(filename, cache_key, range_start, range_size);
 	}
 	io_cvs[target_thread].notify_one();
 }
@@ -318,35 +318,25 @@ void BlobCache::ProcessReadJob(const BlobCacheReadJob &job) {
 void BlobCache::MainIOThreadLoop(idx_t thread_id) {
 	config.LogDebug("MainIOThreadLoop " + std::to_string(thread_id) + " started");
 	while (!shutdown_io_threads) {
-		BlobCacheWriteJob write_job;
-		BlobCacheReadJob read_job;
-		bool has_write = false, has_read = false;
+		std::unique_lock<std::mutex> lock(io_mutexes[thread_id]);
+		io_cvs[thread_id].wait(lock, [this, thread_id] {
+			return !write_queues[thread_id].empty() || !read_queues[thread_id].empty() || shutdown_io_threads;
+		});
 
-		{ // Wait for any job or shutdown signal
-			std::unique_lock<std::mutex> lock(io_mutexes[thread_id]);
-			io_cvs[thread_id].wait(lock, [this, thread_id] {
-				return !write_queues[thread_id].empty() || !read_queues[thread_id].empty() || shutdown_io_threads;
-			});
-
-			if (shutdown_io_threads && write_queues[thread_id].empty() && read_queues[thread_id].empty()) {
-				break;
-			}
-
-			// Process writes with priority
-			if (!write_queues[thread_id].empty()) {
-				write_job = std::move(write_queues[thread_id].front());
-				write_queues[thread_id].pop();
-				has_write = true;
-			} else if (!read_queues[thread_id].empty()) {
-				read_job = std::move(read_queues[thread_id].front());
-				read_queues[thread_id].pop();
-				has_read = true;
-			}
+		if (shutdown_io_threads && write_queues[thread_id].empty() && read_queues[thread_id].empty()) {
+			break;
 		}
 
-		if (has_write) {
+		// Process writes with priority
+		if (!write_queues[thread_id].empty()) {
+			auto write_job = std::move(write_queues[thread_id].front());
+			write_queues[thread_id].pop();
+			lock.unlock();
 			ProcessWriteJob(write_job);
-		} else if (has_read) {
+		} else if (!read_queues[thread_id].empty()) {
+			auto read_job = std::move(read_queues[thread_id].front());
+			read_queues[thread_id].pop();
+			lock.unlock();
 			ProcessReadJob(read_job);
 		}
 	}
