@@ -61,6 +61,20 @@ struct BlobCacheFileBuffer {
 	}
 };
 
+// BlobCacheWriteJob - async write job for disk persistence
+struct BlobCacheWriteJob {
+	string filepath;                                // Cache file path to write to
+	duckdb::shared_ptr<BlobCacheFileBuffer> buffer; // Buffer containing data to write
+};
+
+// BlobCacheReadJob - async read job for prefetching
+struct BlobCacheReadJob {
+	string filename;   // File to read from
+	string cache_key;  // Cache key for insertion
+	idx_t range_start; // Start position in file
+	idx_t range_size;  // Bytes to read
+};
+
 //===----------------------------------------------------------------------===//
 // BlobCacheFile caches a URL in used ranges as a ordered map of BlobCacheFileRange
 //===----------------------------------------------------------------------===//
@@ -249,12 +263,14 @@ struct BlobCache {
 	mutable std::mutex regex_mutex;    // Protects cached regex state
 	vector<std::regex> cached_regexps; // Compiled regex patterns
 
-	// Multi-threaded background cache writer system
+	// Multi-threaded background I/O system (writes + reads)
 	std::array<std::thread, MAX_IO_THREADS> io_threads;
-	std::array<std::queue<pair<string, duckdb::shared_ptr<BlobCacheFileBuffer>>>, MAX_IO_THREADS> io_queues;
+	std::array<std::queue<BlobCacheWriteJob>, MAX_IO_THREADS> write_queues;
+	std::array<std::queue<BlobCacheReadJob>, MAX_IO_THREADS> read_queues;
 	std::array<std::mutex, MAX_IO_THREADS> io_mutexes;
 	std::array<std::condition_variable, MAX_IO_THREADS> io_cvs;
 	std::atomic<bool> shutdown_io_threads;
+	std::atomic<idx_t> read_job_counter; // For round-robin read job assignment
 	idx_t num_io_threads;
 
 	// Helper methods for accessing cache and capacity by type
@@ -273,7 +289,7 @@ struct BlobCache {
 	// Constructor/Destructor
 	explicit BlobCache(DatabaseInstance *db_instance = nullptr)
 	    : smallrange_blobcache(make_uniq<BlobCacheMap>(config)), largerange_blobcache(make_uniq<BlobCacheMap>(config)),
-	      shutdown_io_threads(false), num_io_threads(1) {
+	      shutdown_io_threads(false), read_job_counter(0), num_io_threads(1) {
 		if (db_instance) {
 			config.db_instance = db_instance->shared_from_this();
 		}
@@ -286,7 +302,10 @@ struct BlobCache {
 
 	// Thread management
 	void MainIOThreadLoop(idx_t thread_id);
+	void ProcessWriteJob(const BlobCacheWriteJob &job);
+	void ProcessReadJob(const BlobCacheReadJob &job);
 	void QueueIOWrite(const string &filepath, idx_t partition, duckdb::shared_ptr<BlobCacheFileBuffer> buffer);
+	void QueueIORead(const string &filename, const string &cache_key, idx_t range_start, idx_t range_size);
 	void StartIOThreads(idx_t thread_count);
 	void StopIOThreads();
 

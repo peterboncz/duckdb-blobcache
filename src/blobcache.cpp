@@ -32,8 +32,8 @@ idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename, 
 	BlobCacheType blobcache_type = // Determine which blobcache to use based on request size
 	    (len <= config.small_range_threshold) ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
 	idx_t hit_size = ReadFromCacheInternal(blobcache_type, cache_key, filename, pos, buffer, len);
-	if (hit_size > 0 || blobcache_type == BlobCacheType::LARGE_RANGE) { // Small cache miss - try large cache also
-		return hit_size;
+	if (hit_size > 0 || blobcache_type == BlobCacheType::LARGE_RANGE) {
+		return hit_size; // hit or large request
 	}
 	// for SMALL_RANGE, also try the LARGE_RANGE cache, but if found, replicate the range in the smallrange cache
 	hit_size = ReadFromCacheInternal(BlobCacheType::LARGE_RANGE, cache_key, filename, pos, buffer, len);
@@ -218,11 +218,21 @@ bool BlobCache::TryReadFromMemcache(const string &blobcache_filepath, idx_t blob
 //===----------------------------------------------------------------------===//
 
 void BlobCache::QueueIOWrite(const string &filepath, idx_t partition, duckdb::shared_ptr<BlobCacheFileBuffer> buffer) {
-	{ // Use first 2 hex chars from filepath for partitioning
+	{
 		std::lock_guard<std::mutex> lock(io_mutexes[partition]);
-		io_queues[partition].emplace(filepath, buffer);
+		write_queues[partition].emplace(BlobCacheWriteJob {filepath, buffer});
 	}
 	io_cvs[partition].notify_one();
+}
+
+void BlobCache::QueueIORead(const string &filename, const string &cache_key, idx_t range_start, idx_t range_size) {
+	// Round-robin assignment across all threads (no partitioning needed for reads)
+	idx_t target_thread = read_job_counter.fetch_add(1, std::memory_order_relaxed) % num_io_threads;
+	{
+		std::lock_guard<std::mutex> lock(io_mutexes[target_thread]);
+		read_queues[target_thread].emplace(BlobCacheReadJob {filename, cache_key, range_start, range_size});
+	}
+	io_cvs[target_thread].notify_one();
 }
 
 void BlobCache::StartIOThreads(idx_t thread_count) {
@@ -267,52 +277,80 @@ void BlobCache::StopIOThreads() {
 	num_io_threads = 0; // Reset thread count
 }
 
+void BlobCache::ProcessWriteJob(const BlobCacheWriteJob &job) {
+	// Determine cache type from filename: /cachedir/1234/567890ABCDEFsID:FILE:PROT -> 's' means SMALL_RANGE
+	size_t last_sep = job.filepath.find_last_of(config.path_sep);
+	char type_char = job.filepath[last_sep + 12 + 1]; // after / there are 12 hex chars and then 's' or 'l'
+	BlobCacheType cache_type = (type_char == 's') ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
+	BlobCacheMap &cache = GetCacheMap(cache_type);
+
+	idx_t blobcache_range_start;
+	if (cache.WriteToCacheFile(job.filepath, job.buffer->buffer_handle.Ptr(), job.buffer->size,
+	                           blobcache_range_start)) {
+		// Mark disk write as completed via backpointer
+		job.buffer->disk_write_completed_ptr->store(true, std::memory_order_release);
+		// Unpin the buffer now that write is complete - allows buffer manager to evict if needed
+		job.buffer->Unpin();
+	} else {
+		// Write failed - log error (memcache has stale data, but eviction is unsafe from background thread)
+		config.LogError("ProcessWriteJob: failed to write '" + job.filepath + "'");
+	}
+}
+
+void BlobCache::ProcessReadJob(const BlobCacheReadJob &job) {
+	try {
+		// Open file and allocate buffer
+		auto &fs = config.GetFileSystem();
+		auto handle = fs.OpenFile(job.filename, FileOpenFlags::FILE_FLAGS_READ);
+		auto buffer = unique_ptr<char[]>(new char[job.range_size]);
+
+		// Read data from file
+		fs.Read(*handle, buffer.get(), job.range_size, job.range_start);
+
+		// Insert into cache (this will queue a write job)
+		InsertCache(job.cache_key, job.filename, job.range_start, buffer.get(), job.range_size);
+	} catch (const std::exception &e) {
+		config.LogError("ProcessReadJob: failed to read '" + job.filename + "' at " + to_string(job.range_start) +
+		                ": " + string(e.what()));
+	}
+}
+
 void BlobCache::MainIOThreadLoop(idx_t thread_id) {
 	config.LogDebug("MainIOThreadLoop " + std::to_string(thread_id) + " started");
 	while (!shutdown_io_threads) {
-		pair<string, duckdb::shared_ptr<BlobCacheFileBuffer>> job;
-		bool has_job = false;
-		{ // Wait for a job or shutdown signal for this thread's queue
-			std::unique_lock<std::mutex> lock(io_mutexes[thread_id]);
-			io_cvs[thread_id].wait(lock,
-			                       [this, thread_id] { return !io_queues[thread_id].empty() || shutdown_io_threads; });
+		BlobCacheWriteJob write_job;
+		BlobCacheReadJob read_job;
+		bool has_write = false, has_read = false;
 
-			if (shutdown_io_threads && io_queues[thread_id].empty()) {
+		{ // Wait for any job or shutdown signal
+			std::unique_lock<std::mutex> lock(io_mutexes[thread_id]);
+			io_cvs[thread_id].wait(lock, [this, thread_id] {
+				return !write_queues[thread_id].empty() || !read_queues[thread_id].empty() || shutdown_io_threads;
+			});
+
+			if (shutdown_io_threads && write_queues[thread_id].empty() && read_queues[thread_id].empty()) {
 				break;
 			}
-			if (!io_queues[thread_id].empty()) {
-				job = std::move(io_queues[thread_id].front());
-				io_queues[thread_id].pop();
-				has_job = true;
+
+			// Process writes with priority
+			if (!write_queues[thread_id].empty()) {
+				write_job = std::move(write_queues[thread_id].front());
+				write_queues[thread_id].pop();
+				has_write = true;
+			} else if (!read_queues[thread_id].empty()) {
+				read_job = std::move(read_queues[thread_id].front());
+				read_queues[thread_id].pop();
+				has_read = true;
 			}
 		}
-		if (!has_job) {
-			continue;
-		}
-		// Process the cache write job
-		const string &filepath = job.first;
-		auto file_buffer = job.second;
 
-		// Determine cache type from filename: /cachedir/1234/567890ABCDEFsID:FILE:PROT -> 's' means SMALL_RANGE
-		size_t last_sep = filepath.find_last_of(config.path_sep);
-		char type_char = filepath[last_sep + 12 + 1]; // after / there are 12 hex chars and then 's' or 'l'
-		BlobCacheType cache_type = (type_char == 's') ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
-		BlobCacheMap &cache = GetCacheMap(cache_type);
-
-		idx_t blobcache_range_start;
-		if (cache.WriteToCacheFile(filepath, file_buffer->buffer_handle.Ptr(), file_buffer->size,
-		                           blobcache_range_start)) {
-			// Mark disk write as completed via backpointer
-			file_buffer->disk_write_completed_ptr->store(true, std::memory_order_release);
-			// Unpin the buffer now that write is complete - allows buffer manager to evict if needed
-			// The ExternalFileCache can re-pin it via the block_handle when needed
-			file_buffer->Unpin();
-			config.LogDebug("MainIOThreadLoop " + std::to_string(thread_id) + " completed write '" + filepath + "'");
-		} else {
-			// Write failed - log error (memcache has stale data, but eviction is unsafe from background thread)
-			config.LogError("MainIOThreadLoop " + std::to_string(thread_id) + " failed to write  '" + filepath + "'");
+		if (has_write) {
+			ProcessWriteJob(write_job);
+		} else if (has_read) {
+			ProcessReadJob(read_job);
 		}
 	}
+
 	// Only log thread shutdown if not during database shutdown to avoid access to destroyed instance
 	if (!config.blobcache_shutting_down) {
 		config.LogDebug("MainIOThreadLoop " + std::to_string(thread_id) + " stopped");

@@ -362,29 +362,16 @@ static void BlobCachePrefetchFunction(DataChunk &args, ExpressionState &state, V
 		ranges.push_back(new_range);
 	}
 
-	// Prefetch all concatenated ranges by directly reading and inserting into cache
-	auto &fs = FileSystem::GetFileSystem(db);
+	// Queue all concatenated ranges as async read jobs for parallel execution
 	for (auto &entry : ranges_by_file) {
 		const string &filename = entry.first;
 		auto &ranges = entry.second;
+		string cache_key = cache->config.GenCacheKey(filename);
 
-		try {
-			// Open file for reading
-			auto handle = fs.OpenFile(filename, FileOpenFlags::FILE_FLAGS_READ);
-			string cache_key = cache->config.GenCacheKey(filename);
-
-			for (auto &range : ranges) {
-				idx_t bytes_to_read = range.end - range.start;
-				auto buffer = unique_ptr<char[]>(new char[bytes_to_read]);
-
-				// Read data from file
-				fs.Read(*handle, buffer.get(), bytes_to_read, range.start);
-
-				// Directly insert into cache (bypass wrapper check)
-				cache->InsertCache(cache_key, filename, range.start, buffer.get(), bytes_to_read);
-			}
-		} catch (...) {
-			// Ignore errors for individual files
+		for (auto &range : ranges) {
+			idx_t bytes_to_read = range.end - range.start;
+			// Queue read job to IO threads - will be executed in parallel
+			cache->QueueIORead(filename, cache_key, range.start, bytes_to_read);
 		}
 	}
 
