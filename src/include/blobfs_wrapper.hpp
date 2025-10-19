@@ -15,13 +15,13 @@ struct BlobCache;
 class BlobFileHandle;
 
 //===----------------------------------------------------------------------===//
-// BlobCacheEntry - ObjectCache wrapper for BlobCache
+// BlobCacheObjectCacheEntry - ObjectCache wrapper for BlobCache
 //===----------------------------------------------------------------------===//
-class BlobCacheEntry : public ObjectCacheEntry {
+class BlobCacheObjectCacheEntry : public ObjectCacheEntry {
 public:
 	shared_ptr<BlobCache> cache;
 
-	explicit BlobCacheEntry(shared_ptr<BlobCache> cache_p) : cache(std::move(cache_p)) {
+	explicit BlobCacheObjectCacheEntry(shared_ptr<BlobCache> cache_p) : cache(std::move(cache_p)) {
 	}
 
 	string GetObjectType() override {
@@ -33,7 +33,7 @@ public:
 	}
 
 	// ObjectCacheEntry is properly destructed automatically
-	~BlobCacheEntry() override = default;
+	~BlobCacheObjectCacheEntry() override = default;
 };
 
 //===----------------------------------------------------------------------===//

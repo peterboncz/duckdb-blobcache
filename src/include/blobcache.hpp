@@ -88,7 +88,7 @@ struct BlobCacheReadJob {
 };
 
 //===----------------------------------------------------------------------===//
-// BlobCacheFile caches a URL in used ranges as a ordered map of BlobCacheFileRange
+// BlobCacheEntry caches a URL in used ranges as a ordered map of BlobCacheFileRange
 //===----------------------------------------------------------------------===//
 struct BlobCacheFileRange {
 	idx_t range_start = 0, range_end = 0;                            // Range in remote blob file
@@ -102,13 +102,13 @@ struct BlobCacheFileRange {
 	}
 };
 
-struct BlobCacheFile {
-	string filename;                                        // full URL
-	map<idx_t, unique_ptr<BlobCacheFileRange>> ranges;      // Map of start position to unique BlobCacheFileRange
-	idx_t cached_file_size = 0;                             // Total bytes cached for this file
-	idx_t current_blobcache_file_offset = 0;                // Current offset for next append write
-	idx_t file_id = 0;                                      // unique file-id ensures every filename is unique
-	BlobCacheFile *lru_prev = nullptr, *lru_next = nullptr; // LRU linked list pointers
+struct BlobCacheEntry {
+	string filename;                                         // full URL
+	map<idx_t, unique_ptr<BlobCacheFileRange>> ranges;       // Map of start position to unique BlobCacheFileRange
+	idx_t cached_file_size = 0;                              // Total bytes cached for this file
+	idx_t current_blobcache_file_offset = 0;                 // Current offset for next append write
+	idx_t file_id = 0;                                       // unique file-id ensures every filename is unique
+	BlobCacheEntry *lru_prev = nullptr, *lru_next = nullptr; // LRU linked list pointers
 };
 
 //===----------------------------------------------------------------------===//
@@ -189,16 +189,16 @@ struct BlobCacheConfig {
 };
 
 //===----------------------------------------------------------------------===//
-// BlobCacheMap - cache consists of Map(cache_key,BlobCacheFile) and a BlobCacheFile-LRU
+// BlobCacheMap - cache consists of Map(cache_key,BlobCacheEntry) and a BlobCacheEntry-LRU
 //===----------------------------------------------------------------------===//
 struct BlobCacheMap {
 	BlobCacheConfig &config; // Reference to central configuration in BlobCache (includes parent_cache)
-	unique_ptr<unordered_map<string, unique_ptr<BlobCacheFile>>> key_cache; // KV store
-	BlobCacheFile *lru_head = nullptr, *lru_tail = nullptr;                 // LRU
+	unique_ptr<unordered_map<string, unique_ptr<BlobCacheEntry>>> key_cache; // KV store
+	BlobCacheEntry *lru_head = nullptr, *lru_tail = nullptr;                 // LRU
 	idx_t current_size = 0, num_ranges = 0, current_file_id = 0;
 
 	explicit BlobCacheMap(BlobCacheConfig &cfg)
-	    : config(cfg), key_cache(make_uniq<unordered_map<string, unique_ptr<BlobCacheFile>>>()) {
+	    : config(cfg), key_cache(make_uniq<unordered_map<string, unique_ptr<BlobCacheEntry>>>()) {
 	}
 
 	// Cache state management
@@ -211,26 +211,26 @@ struct BlobCacheMap {
 	}
 
 	// Cache management operations
-	BlobCacheFile *FindFile(const string &cache_key, const string &filename) {
+	BlobCacheEntry *FindFile(const string &cache_key, const string &filename) {
 		auto it = key_cache->find(cache_key);
 		return (it != key_cache->end() && it->second->filename == filename) ? it->second.get() : nullptr;
 	}
-	BlobCacheFile *UpsertFile(const string &cache_key, const string &filename) {
-		BlobCacheFile *cache_file = nullptr;
+	BlobCacheEntry *UpsertFile(const string &cache_key, const string &filename) {
+		BlobCacheEntry *cache_entry = nullptr;
 		auto it = key_cache->find(cache_key);
 		if (it == key_cache->end()) {
-			auto new_file = make_uniq<BlobCacheFile>();
-			new_file->filename = filename;
-			new_file->file_id = ++current_file_id; // unique id (filename must be unique each time we cache a file)
-			config.LogDebug("Insert '" + cache_key + "' with file_id " + std::to_string(new_file->file_id));
-			cache_file = new_file.get();
-			(*key_cache)[cache_key] = std::move(new_file);
-			AddToLRUFront(cache_file);
+			auto new_entry = make_uniq<BlobCacheEntry>();
+			new_entry->filename = filename;
+			new_entry->file_id = ++current_file_id; // unique id (filename must be unique each time we cache a file)
+			config.LogDebug("Insert '" + cache_key + "' with file_id " + std::to_string(new_entry->file_id));
+			cache_entry = new_entry.get();
+			(*key_cache)[cache_key] = std::move(new_entry);
+			AddToLRUFront(cache_entry);
 		} else if (it->second->filename == filename) { // collision if not equal
-			cache_file = it->second.get();
-			TouchLRU(cache_file);
+			cache_entry = it->second.get();
+			TouchLRU(cache_entry);
 		}
-		return cache_file; // nullptr if there is a collision and we cannot insert
+		return cache_entry; // nullptr if there is a collision and we cannot insert
 	}
 	size_t EvictCacheKey(const string &cache_key, BlobCacheType cache_type);
 	bool EvictToCapacity(idx_t required_space, BlobCacheType cache_type, const string &exclude_filename = "");
@@ -238,9 +238,9 @@ struct BlobCacheMap {
 	                                BlobCacheType cache_type);
 
 	// LRU list management
-	void TouchLRU(BlobCacheFile *cache_file);
-	void RemoveFromLRU(BlobCacheFile *cache_file);
-	void AddToLRUFront(BlobCacheFile *cache_file);
+	void TouchLRU(BlobCacheEntry *cache_entry);
+	void RemoveFromLRU(BlobCacheEntry *cache_entry);
+	void AddToLRUFront(BlobCacheEntry *cache_entry);
 
 	// File operations (operate on cache_filepath which includes s/l prefix)
 	void EnsureSubdirectoryExists(const string &cache_filepath);
@@ -372,7 +372,7 @@ struct BlobCache {
 	}
 
 	// Internal helpers
-	void InsertRangeInternal(BlobCacheType cache_type, BlobCacheFile *cache_file, const string &cache_key,
+	void InsertRangeInternal(BlobCacheType cache_type, BlobCacheEntry *cache_entry, const string &cache_key,
 	                         const string &filename, idx_t range_start, idx_t range_end, const void *buffer);
 	idx_t ReadFromCacheInternal(BlobCacheType cache_type, const string &cache_key, const string &filename,
 	                            idx_t position, void *buffer, idx_t &max_nr_bytes);

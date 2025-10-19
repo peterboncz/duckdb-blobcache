@@ -136,7 +136,7 @@ shared_ptr<BlobCache> GetOrCreateBlobCache(DatabaseInstance &instance) {
 	auto &object_cache = instance.GetObjectCache();
 
 	// Try to get existing cache
-	auto cached_entry = object_cache.Get<BlobCacheEntry>("blobcache_instance");
+	auto cached_entry = object_cache.Get<BlobCacheObjectCacheEntry>("blobcache_instance");
 	if (cached_entry) {
 		DUCKDB_LOG_DEBUG(instance, "[BlobCache] Retrieved existing BlobCache from ObjectCache");
 		return cached_entry->cache;
@@ -144,7 +144,7 @@ shared_ptr<BlobCache> GetOrCreateBlobCache(DatabaseInstance &instance) {
 
 	// Create new cache and store in ObjectCache
 	auto new_cache = make_shared_ptr<BlobCache>(&instance);
-	auto cache_entry = make_shared_ptr<BlobCacheEntry>(new_cache);
+	auto cache_entry = make_shared_ptr<BlobCacheObjectCacheEntry>(new_cache);
 	object_cache.Put("blobcache_instance", cache_entry);
 	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Created and stored new BlobCache in ObjectCache");
 

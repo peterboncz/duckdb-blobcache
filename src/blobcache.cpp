@@ -43,13 +43,13 @@ idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename, 
 
 	// we found something in the largerange cache: try to insert the range in smallrange cache as well
 	std::lock_guard<std::mutex> lock(regex_mutex);
-	auto cache_file = smallrange_blobcache->UpsertFile(cache_key, filename);
-	if (!cache_file || !EvictToCapacity(hit_size, filename) || AnalyzeRange(cache_file->ranges, pos, hit_size)) {
+	auto cache_entry = smallrange_blobcache->UpsertFile(cache_key, filename);
+	if (!cache_entry || !EvictToCapacity(hit_size, filename) || AnalyzeRange(cache_entry->ranges, pos, hit_size)) {
 		return hit_size; // should't insert in smallrange after all (collision, eviction failure, concurrent insertion)
 	}
 	config.LogDebug("DuplicateRangeToSmallCache: duplicate " + to_string(hit_size) +
 	                " bytes from large cache to small cache for '" + filename + "' at position " + to_string(pos));
-	InsertRangeInternal(BlobCacheType::SMALL_RANGE, cache_file, cache_key, filename, pos, pos + hit_size, buffer);
+	InsertRangeInternal(BlobCacheType::SMALL_RANGE, cache_entry, cache_key, filename, pos, pos + hit_size, buffer);
 	return hit_size;
 }
 
@@ -57,12 +57,12 @@ idx_t BlobCache::ReadFromCacheInternal(BlobCacheType cache_type, const string &c
                                        idx_t position, void *buffer, idx_t &max_nr_bytes) {
 	std::unique_lock<std::mutex> lock(blobcache_mutex);
 	auto &blobcache_map = GetCacheMap(cache_type);
-	BlobCacheFile *blobcache_file = blobcache_map.FindFile(cache_key, filename);
-	if (!blobcache_file) {
+	BlobCacheEntry *blobcache_entry = blobcache_map.FindFile(cache_key, filename);
+	if (!blobcache_entry) {
 		return 0; // Nothing cached for this file
 	}
-	blobcache_map.TouchLRU(blobcache_file);
-	auto hit_range = AnalyzeRange(blobcache_file->ranges, position, max_nr_bytes);
+	blobcache_map.TouchLRU(blobcache_entry);
+	auto hit_range = AnalyzeRange(blobcache_entry->ranges, position, max_nr_bytes);
 	if (!hit_range) {
 		return 0; // No overlapping range
 	}
@@ -74,7 +74,7 @@ idx_t BlobCache::ReadFromCacheInternal(BlobCacheType cache_type, const string &c
 
 	// Copy data needed before unlocking
 	idx_t cached_blobcache_range_start = hit_range->blobcache_range_start;
-	auto file_id = blobcache_file->file_id;
+	auto file_id = blobcache_entry->file_id;
 	idx_t saved_range_start = hit_range->range_start;
 	lock.unlock();
 
@@ -89,10 +89,10 @@ idx_t BlobCache::ReadFromCacheInternal(BlobCacheType cache_type, const string &c
 	// Update bytes_from_mem counter if we had a memory hit
 	if (bytes_from_mem > 0) {
 		lock.lock();
-		blobcache_file = blobcache_map.FindFile(cache_key, filename);
-		if (blobcache_file && blobcache_file->file_id == file_id) {
-			auto range_it = blobcache_file->ranges.find(saved_range_start);
-			if (range_it != blobcache_file->ranges.end()) {
+		blobcache_entry = blobcache_map.FindFile(cache_key, filename);
+		if (blobcache_entry && blobcache_entry->file_id == file_id) {
+			auto range_it = blobcache_entry->ranges.find(saved_range_start);
+			if (range_it != blobcache_entry->ranges.end()) {
 				range_it->second->bytes_from_mem += bytes_from_mem;
 			}
 		}
@@ -110,12 +110,12 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 	    (len <= config.small_range_threshold) ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
 
 	std::lock_guard<std::mutex> lock(regex_mutex);
-	auto cache_file = GetCacheMap(cache_type).UpsertFile(cache_key, filename);
-	if (!cache_file) {
+	auto cache_entry = GetCacheMap(cache_type).UpsertFile(cache_key, filename);
+	if (!cache_entry) {
 		return; // name collision (rare)
 	}
 	// Check (under lock) if range already cached (in the meantime, due to concurrent reads)
-	auto hit_range = AnalyzeRange(cache_file->ranges, pos, len);
+	auto hit_range = AnalyzeRange(cache_entry->ranges, pos, len);
 	idx_t offset = 0, actual_bytes = 0, range_start = pos, range_end = range_start + len;
 	if (hit_range) { // another thread cached the same range in the meantime
 		offset = hit_range->range_end - range_start;
@@ -127,10 +127,11 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 	if (actual_bytes == 0 || !EvictToCapacity(actual_bytes, filename)) {
 		return; // back off, do not cache this range (it's empty, or we failed to make room)
 	}
-	InsertRangeInternal(cache_type, cache_file, cache_key, filename, range_start, range_end, ((char *)buffer) + offset);
+	InsertRangeInternal(cache_type, cache_entry, cache_key, filename, range_start, range_end,
+	                    ((char *)buffer) + offset);
 }
 
-void BlobCache::InsertRangeInternal(BlobCacheType cache_type, BlobCacheFile *blobcache_file, const string &cache_key,
+void BlobCache::InsertRangeInternal(BlobCacheType cache_type, BlobCacheEntry *blobcache_entry, const string &cache_key,
                                     const string &filename, idx_t range_start, idx_t range_end, const void *buffer) {
 	idx_t actual_bytes = range_end - range_start;
 	BufferHandle buffer_handle;
@@ -142,18 +143,18 @@ void BlobCache::InsertRangeInternal(BlobCacheType cache_type, BlobCacheFile *blo
 	// Create new range and update stats
 	auto new_range = make_uniq<BlobCacheFileRange>(range_start, range_end);
 	auto range_ptr = new_range.get();
-	blobcache_file->ranges[range_start] = std::move(new_range);
-	blobcache_file->cached_file_size += actual_bytes;
+	blobcache_entry->ranges[range_start] = std::move(new_range);
+	blobcache_entry->cached_file_size += actual_bytes;
 	auto &blobcache_map = GetCacheMap(cache_type);
 	blobcache_map.current_size += actual_bytes;
 	blobcache_map.num_ranges++;
 
 	// Pre-compute blobcache_range_start (we append sequentially, so we know the offset in advance)
-	range_ptr->blobcache_range_start = blobcache_file->current_blobcache_file_offset;
-	blobcache_file->current_blobcache_file_offset += actual_bytes;
+	range_ptr->blobcache_range_start = blobcache_entry->current_blobcache_file_offset;
+	blobcache_entry->current_blobcache_file_offset += actual_bytes;
 
 	// Register this cached piece in the memcache
-	string blobcache_filepath = config.GenCacheFilePath(blobcache_file->file_id, cache_key, cache_type);
+	string blobcache_filepath = config.GenCacheFilePath(blobcache_entry->file_id, cache_key, cache_type);
 	InsertRangeIntoMemcache(blobcache_filepath, range_ptr->blobcache_range_start, buffer_handle, actual_bytes);
 
 	// Schedule the disk write
@@ -355,7 +356,7 @@ bool BlobCacheMap::EvictToCapacity(idx_t required_space, BlobCacheType cache_typ
 	// Try to evict files to make space (for a new range in exclude_filename), returns true if successful
 	// Note: This is called with blobcache_mutex already held
 	idx_t freed_space = 0;
-	BlobCacheFile *last_attempted_evict = nullptr;
+	BlobCacheEntry *last_attempted_evict = nullptr;
 	while (required_space > freed_space && lru_tail && lru_tail != last_attempted_evict) {
 		auto *file_to_evict = lru_tail;
 		size_t file_space = (file_to_evict->filename == exclude_filename)
@@ -438,7 +439,7 @@ vector<BlobCacheRangeInfo>
 BlobCacheMap::GetStatistics() const { // produce list of cached ranges for blobcache_stats() TF
 	vector<BlobCacheRangeInfo> result;
 	result.reserve(num_ranges);
-	BlobCacheFile *current = lru_tail;
+	BlobCacheEntry *current = lru_tail;
 	while (current) {
 		BlobCacheRangeInfo info;
 		info.protocol = "unknown";
@@ -589,44 +590,44 @@ bool BlobCacheMap::DeleteCacheFile(const string &cache_filepath) {
 //===----------------------------------------------------------------------===//
 // BlobCacheMap LRU management methods
 //===----------------------------------------------------------------------===//
-void BlobCacheMap::TouchLRU(BlobCacheFile *cache_file) {
-	// Move cache_file to front of LRU list (most recently used)
+void BlobCacheMap::TouchLRU(BlobCacheEntry *cache_entry) {
+	// Move cache_entry to front of LRU list (most recently used)
 	// Note: Must be called with blobcache_mutex held
-	if (cache_file == lru_head) {
+	if (cache_entry == lru_head) {
 		return; // Already at front
 	}
-	RemoveFromLRU(cache_file); // Remove from current position
-	AddToLRUFront(cache_file); // Add to front
+	RemoveFromLRU(cache_entry); // Remove from current position
+	AddToLRUFront(cache_entry); // Add to front
 }
 
-void BlobCacheMap::RemoveFromLRU(BlobCacheFile *cache_file) {
-	// Remove cache_file from LRU list
+void BlobCacheMap::RemoveFromLRU(BlobCacheEntry *cache_entry) {
+	// Remove cache_entry from LRU list
 	// Note: Must be called with blobcache_mutex held
-	if (cache_file->lru_prev) {
-		cache_file->lru_prev->lru_next = cache_file->lru_next;
+	if (cache_entry->lru_prev) {
+		cache_entry->lru_prev->lru_next = cache_entry->lru_next;
 	} else {
-		lru_head = cache_file->lru_next;
+		lru_head = cache_entry->lru_next;
 	}
-	if (cache_file->lru_next) {
-		cache_file->lru_next->lru_prev = cache_file->lru_prev;
+	if (cache_entry->lru_next) {
+		cache_entry->lru_next->lru_prev = cache_entry->lru_prev;
 	} else {
-		lru_tail = cache_file->lru_prev;
+		lru_tail = cache_entry->lru_prev;
 	}
-	cache_file->lru_prev = nullptr;
-	cache_file->lru_next = nullptr;
+	cache_entry->lru_prev = nullptr;
+	cache_entry->lru_next = nullptr;
 }
 
-void BlobCacheMap::AddToLRUFront(BlobCacheFile *cache_file) {
-	// Add cache_file to front of LRU list (most recently used)
+void BlobCacheMap::AddToLRUFront(BlobCacheEntry *cache_entry) {
+	// Add cache_entry to front of LRU list (most recently used)
 	// Note: Must be called with blobcache_mutex held
-	cache_file->lru_prev = nullptr;
-	cache_file->lru_next = lru_head;
+	cache_entry->lru_prev = nullptr;
+	cache_entry->lru_next = lru_head;
 	if (lru_head) {
-		lru_head->lru_prev = cache_file;
+		lru_head->lru_prev = cache_entry;
 	}
-	lru_head = cache_file;
+	lru_head = cache_entry;
 	if (!lru_tail) {
-		lru_tail = cache_file;
+		lru_tail = cache_entry;
 	}
 }
 
