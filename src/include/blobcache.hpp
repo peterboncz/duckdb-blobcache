@@ -90,7 +90,7 @@ struct BlobCacheReadJob {
 //===----------------------------------------------------------------------===//
 struct BlobCacheFile {
 	string filepath;                   // Physical cache file path
-	idx_t current_size = 0;            // Current size of this cache file
+	idx_t current_file_size = 0;       // Current size of this cache file
 	idx_t file_id = 0;                 // Unique file ID
 	std::atomic<bool> deleted;         // True when evicted (for lazy deletion)
 	BlobCacheFile *lru_prev = nullptr; // LRU linked list pointers
@@ -142,7 +142,6 @@ struct BlobCacheConfig {
 	idx_t total_cache_capacity = DEFAULT_CACHE_CAPACITY;
 	idx_t small_range_threshold = DEFAULT_SMALL_RANGE_THRESHOLD;
 	idx_t small_range_current_id = 0;
-	std::bitset<4095> subdirs_created; // Subdirectory tracking (shared by both caches)
 
 	// Get FileSystem reference from database instance
 	FileSystem &GetFileSystem() const {
@@ -190,7 +189,7 @@ struct BlobCacheConfig {
 			idx_t subdir_hash = file_id % 4095;
 			oss << std::setw(4) << std::setfill('0') << std::hex << std::uppercase << subdir_hash;
 			string subdir = oss.str();
-			return blobcache_dir + subdir + path_sep + to_string(file_id);
+			return blobcache_dir + subdir + path_sep + "small" + to_string(file_id);
 		} else {
 			// Large range: use cache_key-based naming
 			oss << range_start << "_" << file_id;
@@ -223,7 +222,7 @@ struct BlobCacheMap {
 	unique_ptr<unordered_map<string, unique_ptr<BlobCacheEntry>>> key_cache;     // KV store: cache_key -> CacheEntry
 	unique_ptr<unordered_map<string, unique_ptr<BlobCacheFile>>> filepath_cache; // KV store: filepath -> CacheFile
 	BlobCacheFile *lru_head = nullptr, *lru_tail = nullptr;                      // LRU for CacheFiles
-	idx_t current_size = 0, num_ranges = 0, current_file_id = 10000000;
+	idx_t current_cache_size = 0, num_ranges = 0, current_file_id = 10000000;
 
 	explicit BlobCacheMap(BlobCacheConfig &cfg)
 	    : config(cfg), key_cache(make_uniq<unordered_map<string, unique_ptr<BlobCacheEntry>>>()),
@@ -235,7 +234,7 @@ struct BlobCacheMap {
 		key_cache->clear();
 		filepath_cache->clear();
 		lru_head = lru_tail = nullptr;
-		current_size = num_ranges = 0;
+		current_cache_size = num_ranges = 0;
 	}
 
 	// Cache management operations
@@ -301,7 +300,7 @@ struct BlobCacheMap {
 	}
 
 	// File operations (operate on cache_filepath which includes s/l prefix)
-	void EnsureSubdirectoryExists(const string &cache_filepath);
+	void EnsureSubdirectoryExists(const string &cache_filepath, bool force = false);
 	unique_ptr<FileHandle> TryOpenCacheFile(const string &cache_filepath);
 	bool WriteToCacheFile(const string &blobcache_filepath, const void *buffer, idx_t length,
 	                      idx_t &blobcache_range_start);
@@ -350,7 +349,7 @@ struct BlobCache {
 	idx_t GetCacheCapacity(BlobCacheType type) const {
 		return (type == BlobCacheType::LARGE_RANGE)
 		           ? static_cast<idx_t>(config.total_cache_capacity * 0.9) // Large cache gets 90% of total capacity
-		           : config.total_cache_capacity - largerange_blobcache->current_size; // small cache gets the rest
+		           : config.total_cache_capacity - largerange_blobcache->current_cache_size; // small cache gets rest
 	}
 
 	friend class BlobFilesystemWrapper;

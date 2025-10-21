@@ -230,8 +230,8 @@ static void BlobCacheConfigFunction(ClientContext &context, TableFunctionInput &
 	if (shared_cache && shared_cache->config.blobcache_initialized) {
 		cache_path = shared_cache->config.blobcache_dir;
 		max_size_bytes = shared_cache->config.total_cache_capacity;
-		current_size_bytes =
-		    shared_cache->smallrange_blobcache->current_size + shared_cache->largerange_blobcache->current_size;
+		current_size_bytes = shared_cache->smallrange_blobcache->current_cache_size +
+		                     shared_cache->largerange_blobcache->current_cache_size;
 		writer_threads = shared_cache->num_io_threads;
 	}
 

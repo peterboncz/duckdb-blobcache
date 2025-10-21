@@ -23,7 +23,7 @@ unique_ptr<FileHandle> BlobFilesystemWrapper::OpenFile(const string &path, FileO
 static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_handle, char *buffer, idx_t location,
                        idx_t max_nr_bytes) {
 	// NOTE: ReadFromCache() can return cached_bytes == 0 but adjust max_nr_bytes downwards to align with a cached range
-	blob_handle.cache->config.LogError("ReadChunk(handle=" + to_string(blob_handle.file_handle_id) +
+	blob_handle.cache->config.LogDebug("ReadChunk(handle=" + to_string(blob_handle.file_handle_id) +
 	                                   ", path=" + blob_handle.original_path + ", location=" + to_string(location) +
 	                                   ", max_nr_bytes=" + to_string(max_nr_bytes) + ")");
 	idx_t nr_bytes = blob_handle.cache->ReadFromCache(blob_handle.cache_key, blob_handle.original_path, location,
