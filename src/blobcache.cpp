@@ -78,7 +78,7 @@ static BlobCacheFileRange *AnalyzeRange(map<idx_t, unique_ptr<BlobCacheFileRange
 
 idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename, idx_t pos, void *buffer, idx_t &len) {
 	BlobCacheType blobcache_type = // Determine which blobcache to use based on request size
-	    (len <= config.small_range_threshold) ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
+	    (len < config.small_range_threshold) ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
 	idx_t hit_size = ReadFromCacheInternal(blobcache_type, cache_key, filename, pos, buffer, len);
 	if (hit_size > 0 || blobcache_type == BlobCacheType::LARGE_RANGE) {
 		return hit_size; // hit or large request
@@ -92,7 +92,7 @@ idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename, 
 	// we found something in the largerange cache: try to insert the range in smallrange cache as well
 	std::lock_guard<std::mutex> lock(regex_mutex);
 	auto cache_entry = smallrange_blobcache->UpsertFile(cache_key, filename);
-	if (!cache_entry || !EvictToCapacity(hit_size, "") ||
+	if (!cache_entry || !EvictToCapacity(BlobCacheType::SMALL_RANGE, hit_size, "") ||
 	    AnalyzeRange(cache_entry->ranges, pos, hit_size, smallrange_blobcache->filepath_cache.get())) {
 		return hit_size; // should't insert in smallrange after all (collision, eviction failure, concurrent insertion)
 	}
@@ -163,7 +163,7 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 		return;
 	}
 	BlobCacheType cache_type = // Determine blobcache type based on original request size
-	    (len <= config.small_range_threshold) ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
+	    (len < config.small_range_threshold) ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
 
 	std::lock_guard<std::mutex> lock(regex_mutex);
 	auto &cache_map = GetCacheMap(cache_type);
@@ -188,7 +188,7 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 	// The original protection caused a bug: when a file is larger than cache capacity,
 	// all existing ranges from that file get protected, preventing eviction.
 	// This causes the cache to fill up and refuse new insertions.
-	if (!EvictToCapacity(actual_bytes, "")) {
+	if (!EvictToCapacity(cache_type, actual_bytes, "")) {
 		config.LogError("InsertCache: EvictToCapacity failed for " + to_string(actual_bytes) +
 		                " bytes (cache_type=" + (cache_type == BlobCacheType::LARGE_RANGE ? "large" : "small") +
 		                ", large_size=" + to_string(largerange_blobcache->current_size) +
@@ -437,90 +437,34 @@ void BlobCache::MainIOThreadLoop(idx_t thread_id) {
 BlobCacheFile *BlobCacheMap::GetOrCreateCacheFile(BlobCacheEntry *cache_entry, const string &cache_key,
                                                   BlobCacheType cache_type, idx_t range_start, idx_t range_size) {
 	// Note: Must be called with blobcache_mutex held
-	constexpr idx_t SMALL_FILE_MAX_SIZE = 256 * 1024; // 256KB
-
-	if (cache_type == BlobCacheType::SMALL_RANGE) {
-		// Unified small file handling using enum-indexed arrays
-		// Helper lambda to check if a file of given type can be reused
-		auto try_reuse_file = [&](idx_t type_idx) -> BlobCacheFile * {
-			if (cache_entry->small_filepath[type_idx].empty()) {
-				return nullptr;
+	if (cache_type == BlobCacheType::SMALL_RANGE && cache_entry->cached_file_size + range_size <= 256 * 1024) {
+		auto filepath = config.GenCacheFilePath(current_file_id, cache_key, cache_type);
+		auto cache_file_it = filepath_cache->find(filepath);
+		if (cache_file_it != filepath_cache->end()) {
+			auto cache_file = cache_file_it->second.get();
+			if (!cache_file->deleted.load()) { // ok, we can append to this existing CacheFile
+				cache_entry->cached_file_size += range_size;
+				TouchLRU(cache_file);
+				config.LogDebug("GetOrCreateCacheFile: append range of " + to_string(range_size) + " to " + filepath);
+				return cache_file;
 			}
-			auto cache_file_it = filepath_cache->find(cache_entry->small_filepath[type_idx]);
-			if (cache_file_it == filepath_cache->end()) {
-				return nullptr;
-			}
-			auto *cache_file = cache_file_it->second.get();
-			if (cache_file->deleted.load()) {
-				return nullptr;
-			}
-			if (cache_entry->small_file_size[type_idx] + range_size > SMALL_FILE_MAX_SIZE) {
-				return nullptr;
-			}
-			// Can reuse!
-			cache_entry->small_file_size[type_idx] += range_size;
-			TouchLRU(cache_file);
-			return cache_file;
-		};
-
-		// Try FIRST file first
-		idx_t type_index = static_cast<idx_t>(SmallFileType::FIRST);
-		if (auto *file = try_reuse_file(type_index)) {
-			return file;
 		}
-
-		// FIRST file doesn't work, try NORMAL file
-		type_index = static_cast<idx_t>(SmallFileType::NORMAL);
-		if (auto *file = try_reuse_file(type_index)) {
-			return file;
-		}
-
-		// Need to create a new file - use FIRST if we don't have one yet, otherwise NORMAL
-		SmallFileType type;
-		if (cache_entry->small_filepath[static_cast<idx_t>(SmallFileType::FIRST)].empty()) {
-			type = SmallFileType::FIRST;
-			type_index = static_cast<idx_t>(SmallFileType::FIRST);
-		} else {
-			type = SmallFileType::NORMAL;
-			type_index = static_cast<idx_t>(SmallFileType::NORMAL);
-		}
-
-		idx_t file_id = current_small_file_id++;
-		cache_entry->small_file_id[type_index] = file_id;
-		string filepath = config.GenCacheFilePath(file_id, cache_key, BlobCacheType::SMALL_RANGE, type);
-		cache_entry->small_filepath[type_index] = filepath;
-		cache_entry->small_file_size[type_index] = range_size;
-
-		// Create the CacheFile
-		auto new_cache_file = make_uniq<BlobCacheFile>(filepath, file_id, BlobCacheType::SMALL_RANGE, cache_key);
-		auto cache_file_ptr = new_cache_file.get();
-		(*filepath_cache)[filepath] = std::move(new_cache_file);
-		AddToLRUFront(cache_file_ptr);
-
-		config.LogDebug("Created small cache file: " + filepath);
-		return cache_file_ptr;
-	} else {
-		// Large range: always create a new CacheFile
-		idx_t file_id = ++current_file_id;
-		string filepath =
-		    config.GenCacheFilePath(file_id, cache_key, BlobCacheType::LARGE_RANGE, SmallFileType::FIRST, range_start);
-
-		auto new_cache_file = make_uniq<BlobCacheFile>(filepath, file_id, BlobCacheType::LARGE_RANGE, cache_key);
-		auto cache_file_ptr = new_cache_file.get();
-
-		(*filepath_cache)[filepath] = std::move(new_cache_file);
-		AddToLRUFront(cache_file_ptr);
-
-		config.LogDebug("Created large cache file: " + filepath);
-		return cache_file_ptr;
 	}
+	// Create a new CacheFile
+	auto filepath = config.GenCacheFilePath(++current_file_id, cache_key, cache_type);
+	auto new_cache_file = make_uniq<BlobCacheFile>(filepath, current_file_id, cache_key);
+	auto cache_file_ptr = new_cache_file.get();
+	(*filepath_cache)[filepath] = std::move(new_cache_file);
+	AddToLRUFront(cache_file_ptr);
+	config.LogDebug("GetOrCreateCacheFile: create " + filepath + " for range of " + to_string(range_size));
+	return cache_file_ptr;
 }
 
 //===----------------------------------------------------------------------===//
 // BlobCacheMap - eviction logic
 //===----------------------------------------------------------------------===//
 
-bool BlobCacheMap::EvictToCapacity(idx_t required_space, BlobCacheType cache_type, const string &exclude_cache_key) {
+bool BlobCacheMap::EvictToCapacity(idx_t required_space, const string &exclude_cache_key) {
 	// Try to evict CacheFiles to make space, returns true if successful
 	// Note: This is called with blobcache_mutex already held
 	idx_t freed_space = 0;
@@ -546,14 +490,9 @@ bool BlobCacheMap::EvictToCapacity(idx_t required_space, BlobCacheType cache_typ
 			continue;
 		}
 
-		// CRITICAL: Skip if this CacheFile has pending writes
-		// We cannot evict a file while background writes are in progress, as this would:
-		// 1. Mark ranges as stale before their writes complete
-		// 2. Delete physical files that write jobs are about to write to
-		// This is the key to ensuring writes complete before eviction
 		if (current->current_size == 0) {
-			// CacheFile was just created but no writes completed yet - skip it
-			config.LogDebug("EvictToCapacity: skipping CacheFile with pending writes: '" + current->filepath + "'");
+			// CacheFile was just created but no writes completed yet - skip it also as it would not help reach target
+			config.LogDebug("EvictToCapacity: skipping still empty CacheFile: '" + current->filepath + "'");
 			current = next_to_try;
 			continue;
 		}
@@ -596,90 +535,6 @@ bool BlobCacheMap::EvictToCapacity(idx_t required_space, BlobCacheType cache_typ
 		return false;
 	}
 	return true;
-}
-
-size_t BlobCacheMap::EvictCacheKey(const string &cache_key, BlobCacheType cache_type) {
-	idx_t evicted_bytes = 0;
-	auto it = key_cache->find(cache_key);
-	if (it == key_cache->end()) {
-		config.LogDebug("EvictCacheKey: '" + cache_key + "' not found");
-		return 0;
-	}
-
-	// Check for ongoing writes
-	for (auto &range : it->second->ranges) {
-		if (!range.second->disk_write_completed.load()) {
-			config.LogDebug("EvictCacheKey: '" + cache_key + "' skipped due to ongoing writes");
-			return 0;
-		}
-		evicted_bytes += range.second->range_end - range.second->range_start;
-	}
-
-	// Collect unique CacheFile filepaths to evict (multiple ranges may share the same CacheFile)
-	std::unordered_set<string> cache_filepaths_to_evict;
-	for (auto &range : it->second->ranges) {
-		if (!range.second->cache_filepath.empty()) {
-			cache_filepaths_to_evict.insert(range.second->cache_filepath);
-		}
-	}
-
-	// Evict each unique CacheFile
-	for (const auto &filepath : cache_filepaths_to_evict) {
-		auto cache_file_it = filepath_cache->find(filepath);
-		if (cache_file_it != filepath_cache->end()) {
-			auto *cache_file = cache_file_it->second.get();
-
-			// Mark as deleted (ranges will be cleaned up lazily)
-			cache_file->deleted.store(true, std::memory_order_release);
-
-			// Remove from LRU and filepath_cache
-			RemoveFromLRU(cache_file);
-			filepath_cache->erase(filepath);
-
-			// Delete the physical file
-			DeleteCacheFile(filepath);
-		}
-	}
-
-	// Update stats and remove CacheEntry
-	current_size -= std::min<idx_t>(current_size, evicted_bytes);
-	num_ranges -= std::min<idx_t>(num_ranges, it->second->ranges.size());
-	key_cache->erase(it);
-
-	config.LogDebug("EvictCacheKey: evicted '" + cache_key + "' freeing " + std::to_string(evicted_bytes) + " bytes");
-	return evicted_bytes;
-}
-
-void BlobCacheMap::PurgeCacheForPatternChange(const vector<std::regex> &regexps, optional_ptr<FileOpener> opener,
-                                              BlobCacheType cache_type) {
-	// First pass: collect keys to evict (avoid iterator invalidation)
-	vector<string> keys_to_evict;
-	for (const auto &cache_pair : *key_cache) { // Check all files in this cache
-		auto should_cache = false;              // Check if this file should still be cached
-		if (regexps.empty()) {
-			// Conservative mode: only cache .parquet files when parquet_metadata_cache=true
-			if (opener && StringUtil::EndsWith(StringUtil::Lower(cache_pair.second->filename), ".parquet")) {
-				Value parquet_cache_value;
-				auto parquet_result =
-				    FileOpener::TryGetCurrentSetting(opener, "parquet_metadata_cache", parquet_cache_value);
-				should_cache = (parquet_result && BooleanValue::Get(parquet_cache_value));
-			}
-		} else { // Aggressive mode: use regex patterns
-			for (const auto &pattern : regexps) {
-				if (std::regex_search(cache_pair.second->filename, pattern)) {
-					should_cache = true;
-					break;
-				}
-			}
-		}
-		if (!should_cache) {
-			keys_to_evict.push_back(cache_pair.first);
-		}
-	}
-	// Second pass: evict collected keys (safe, no iterator invalidation)
-	for (const auto &key : keys_to_evict) {
-		EvictCacheKey(key, cache_type);
-	}
 }
 
 vector<BlobCacheRangeInfo>
@@ -840,97 +695,41 @@ bool BlobCacheMap::DeleteCacheFile(const string &cache_filepath) {
 }
 
 //===----------------------------------------------------------------------===//
-// BlobCacheMap LRU management methods
-//===----------------------------------------------------------------------===//
-void BlobCacheMap::TouchLRU(BlobCacheFile *cache_file) {
-	// Move cache_file to front of LRU list (most recently used)
-	// Note: Must be called with blobcache_mutex held
-	if (cache_file == lru_head) {
-		return; // Already at front
-	}
-	RemoveFromLRU(cache_file); // Remove from current position
-	AddToLRUFront(cache_file); // Add to front
-}
-
-void BlobCacheMap::RemoveFromLRU(BlobCacheFile *cache_file) {
-	// Remove cache_file from LRU list
-	// Note: Must be called with blobcache_mutex held
-	if (cache_file->lru_prev) {
-		cache_file->lru_prev->lru_next = cache_file->lru_next;
-	} else {
-		lru_head = cache_file->lru_next;
-	}
-	if (cache_file->lru_next) {
-		cache_file->lru_next->lru_prev = cache_file->lru_prev;
-	} else {
-		lru_tail = cache_file->lru_prev;
-	}
-	cache_file->lru_prev = nullptr;
-	cache_file->lru_next = nullptr;
-}
-
-void BlobCacheMap::AddToLRUFront(BlobCacheFile *cache_file) {
-	// Add cache_file to front of LRU list (most recently used)
-	// Note: Must be called with blobcache_mutex held
-	cache_file->lru_prev = nullptr;
-	cache_file->lru_next = lru_head;
-	if (lru_head) {
-		lru_head->lru_prev = cache_file;
-	}
-	lru_head = cache_file;
-	if (!lru_tail) {
-		lru_tail = cache_file;
-	}
-}
-
-//===----------------------------------------------------------------------===//
 // BlobCache eviction from both (small,large) range caches
 //===----------------------------------------------------------------------===//
 
-bool BlobCache::EvictToCapacity(idx_t extra_bytes, const string &exclude_cache_key) {
-	// note: mutex should already be held
-
+bool BlobCache::EvictToCapacity(BlobCacheType cache_type, idx_t new_range_size, const string &exclude_cache_key) {
 	/* CRITICAL REASONING - DO NOT MODIFY WITHOUT UNDERSTANDING THIS LOGIC:
 	 *
 	 * Small and large caches share the SAME total capacity pool (e.g., 1GB total).
 	 * Small cache gets 10% (100MB), large cache gets 90% (900MB) of the total.
 	 *
 	 * KEY INSIGHT: When large cache grows, small cache capacity SHRINKS (they're coupled).
-	 * Example: If large cache is at 950MB (over its 900MB limit), small cache's effective
-	 * capacity becomes only 50MB, even though it hasn't grown. The small cache is now "too large"
-	 * relative to available capacity, even though nothing was added to it.
+	 * Example: If large cache grows from 800MB to 850MB (still below its 900MB limit), small cache's
+	 * effective capacity reduces from 200MB to 150MB, and even though it hasn't grown, it is is now "too large"
 	 *
-	 * Therefore, when evicting for ANY insertion (large or small):
-	 * 1. Evict from large cache to make room for extra_bytes (the new insertion)
+	 * Therefore, when evicting for large insertion:
+	 * 1. Evict from large cache to make room for new_range_size (the new insertion)
 	 * 2. ALWAYS check if small cache needs eviction, regardless of step 1's outcome
-	 * 3. The check (current_size + extra_bytes > capacity) works for BOTH caches
-	 * 4. Even if extra_bytes is satisfied by large cache eviction, small cache may still be over limit
-	 *
-	 * COMMON MISTAKES TO AVOID (this has been fixed multiple times):
-	 * - DO NOT set extra_bytes=0 after large cache eviction
-	 * - DO NOT skip small cache check if large cache eviction succeeded
-	 * - DO NOT add a target_cache parameter to make eviction "smart" - it needs to check BOTH always
-	 * - DO NOT assume extra_bytes=0 means no eviction needed - small cache may still be over capacity
-	 *
-	 * The logic is simple: ALWAYS check both caches against their limits. Period.
+	 * 3. if the large eviction already made room for new_range_size, it can be set to zero for the small cache checl
+	 * 4. because even if new_range_size is satisfied by large cache eviction, small cache may still be over limit
 	 */
-
-	idx_t large_capacity = GetCacheCapacity(BlobCacheType::LARGE_RANGE);
 	auto result = true;
-	if (largerange_blobcache->current_size + extra_bytes > large_capacity) {
-		if (!largerange_blobcache->EvictToCapacity(largerange_blobcache->current_size + extra_bytes - large_capacity,
-		                                           BlobCacheType::LARGE_RANGE, exclude_cache_key)) {
-			result = false;
+	if (cache_type == BlobCacheType::LARGE_RANGE) {
+		idx_t large_cap = GetCacheCapacity(BlobCacheType::LARGE_RANGE);
+		if (largerange_blobcache->current_size + new_range_size > large_cap) {
+			if (!largerange_blobcache->EvictToCapacity(largerange_blobcache->current_size + new_range_size - large_cap,
+			                                           exclude_cache_key)) {
+				result = false;
+			} else {
+				new_range_size = 0; // we have made space, but still will check small cache
+			}
 		}
 	}
-	// Always check small cache - even if large cache eviction succeeded, small cache may be over capacity
-	// CRITICAL: Recalculate small capacity AFTER large cache eviction, since small capacity depends on large
-	// current_size
-	idx_t small_capacity = GetCacheCapacity(BlobCacheType::SMALL_RANGE);
-	if (smallrange_blobcache->current_size + extra_bytes > small_capacity) {
-		result &=
-		    smallrange_blobcache->EvictToCapacity(smallrange_blobcache->current_size + extra_bytes - small_capacity,
-		                                          BlobCacheType::SMALL_RANGE, exclude_cache_key);
+	idx_t small_cap = GetCacheCapacity(BlobCacheType::SMALL_RANGE);
+	if (smallrange_blobcache->current_size + new_range_size > small_cap) {
+		result &= smallrange_blobcache->EvictToCapacity(smallrange_blobcache->current_size + new_range_size - small_cap,
+		                                                exclude_cache_key);
 	}
 	return result;
 }
@@ -972,7 +771,7 @@ void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx
 	bool size_changed = (config.total_cache_capacity != max_size_bytes);
 	bool threshold_changed = (config.small_range_threshold != small_threshold);
 	if (!directory_changed && !need_restart_threads && !size_changed && !threshold_changed) {
-		config.LogDebug("Cache configuration unchanged, no action needed");
+		config.LogDebug("ConfigureCache: configuration unchanged, no action needed");
 		return;
 	}
 

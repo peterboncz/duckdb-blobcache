@@ -220,7 +220,6 @@ static void BlobCacheConfigFunction(ClientContext &context, TableFunctionInput &
 
 			// Update regex patterns and purge non-qualifying cache entries
 			shared_cache->UpdateRegexPatterns(bind_data.regex_patterns);
-			shared_cache->PurgeCacheForPatternChange(nullptr);
 			success = true;
 			// Now that cache is configured, wrap any existing filesystems
 			WrapExistingFilesystems(*context.db);
