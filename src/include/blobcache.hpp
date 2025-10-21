@@ -30,6 +30,12 @@ enum class BlobCacheType : uint8_t {
 	LARGE_RANGE = 1  // Large ranges (> threshold)
 };
 
+// Small file type for unified first/small file logic
+enum class SmallFileType : uint8_t {
+	FIRST = 0, // A small access that was the first in a particular CacheEntry
+	NORMAL = 1 // Other small accesses
+};
+
 // Statistics structure
 struct BlobCacheRangeInfo {
 	string protocol;
@@ -88,6 +94,24 @@ struct BlobCacheReadJob {
 };
 
 //===----------------------------------------------------------------------===//
+// BlobCacheFile - represents a physical cache file on disk
+//===----------------------------------------------------------------------===//
+struct BlobCacheFile {
+	string filepath;                   // Physical cache file path
+	idx_t current_size = 0;            // Current size of this cache file
+	idx_t file_id = 0;                 // Unique file ID
+	BlobCacheType cache_type;          // SMALL_RANGE or LARGE_RANGE
+	std::atomic<bool> deleted;         // True when evicted (for lazy deletion)
+	BlobCacheFile *lru_prev = nullptr; // LRU linked list pointers
+	BlobCacheFile *lru_next = nullptr;
+	string cache_key; // Cache key of primary CacheEntry (for exclude_filename logic)
+
+	BlobCacheFile(string path, idx_t id, BlobCacheType type, string key = "")
+	    : filepath(std::move(path)), file_id(id), cache_type(type), deleted(false), cache_key(std::move(key)) {
+	}
+};
+
+//===----------------------------------------------------------------------===//
 // BlobCacheEntry caches a URL in used ranges as a ordered map of BlobCacheFileRange
 //===----------------------------------------------------------------------===//
 struct BlobCacheFileRange {
@@ -96,6 +120,7 @@ struct BlobCacheFileRange {
 	std::atomic<bool> disk_write_completed;                          // True when background write to disk completes
 	idx_t usage_count = 0, bytes_from_cache = 0, bytes_from_mem = 0; // Statistics
 	duckdb::shared_ptr<BlobCacheFileBuffer> memcache_buffer; // In-memory buffer (references ExternalFileCache buffer)
+	string cache_filepath;                                   // Path to cache file (for lookup in filepath_cache)
 
 	BlobCacheFileRange(idx_t start, idx_t end)
 	    : range_start(start), range_end(end), blobcache_range_start(0), disk_write_completed(false) {
@@ -103,12 +128,14 @@ struct BlobCacheFileRange {
 };
 
 struct BlobCacheEntry {
-	string filename;                                         // full URL
-	map<idx_t, unique_ptr<BlobCacheFileRange>> ranges;       // Map of start position to unique BlobCacheFileRange
-	idx_t cached_file_size = 0;                              // Total bytes cached for this file
-	idx_t current_blobcache_file_offset = 0;                 // Current offset for next append write
-	idx_t file_id = 0;                                       // unique file-id ensures every filename is unique
-	BlobCacheEntry *lru_prev = nullptr, *lru_next = nullptr; // LRU linked list pointers
+	string filename;                                   // full URL
+	map<idx_t, unique_ptr<BlobCacheFileRange>> ranges; // Map of start position to unique BlobCacheFileRange
+	idx_t cached_file_size = 0;                        // Total bytes cached for this file
+
+	// Per-type tracking for small files: [FIRST, NORMAL]
+	idx_t small_file_id[2] = {0, 0};   // File IDs for first/normal small files
+	string small_filepath[2];          // Current filepath for first/normal small files being written
+	idx_t small_file_size[2] = {0, 0}; // Current size of first/normal small files
 };
 
 //===----------------------------------------------------------------------===//
@@ -116,7 +143,7 @@ struct BlobCacheEntry {
 //===----------------------------------------------------------------------===//
 struct BlobCacheConfig {
 	static constexpr idx_t DEFAULT_CACHE_CAPACITY = 1024ULL * 1024 * 1024; // 1GB default
-	static constexpr idx_t DEFAULT_SMALL_RANGE_THRESHOLD = 2047;           // Default threshold for small ranges
+	static constexpr idx_t DEFAULT_SMALL_RANGE_THRESHOLD = 16383;          // Default threshold for small ranges (16KB)
 	static constexpr idx_t FILENAME_SUFFIX_LEN = 15;
 
 	shared_ptr<DatabaseInstance> db_instance;
@@ -162,12 +189,31 @@ struct BlobCacheConfig {
 		return CleanCacheDir();
 	}
 
-	// inline to demonstrate path structure: /blobcache_dir/cache_key[0..3]/cache_key[4..15](s|l)file_id:cache_key[16..]
-	string GenCacheFilePath(idx_t file_id, const string &cache_key, BlobCacheType type) const {
+	// Naming scheme:
+	// Small files:  /blobcache_dir/{id%4095 in 4-char hex}/first{id} or small{id}
+	// Large files:  /blobcache_dir/{cache_key[0..3]}/{cache_key[4..15]}{range_start}_{file_id}{cache_key[16..]}
+	string GenCacheFilePath(idx_t file_id, const string &cache_key, BlobCacheType type,
+	                        SmallFileType small_type = SmallFileType::FIRST, idx_t range_start = 0) const {
 		std::ostringstream oss;
-		oss << std::setw(19) << std::setfill('0') << file_id;
-		return blobcache_dir + cache_key.substr(0, 4) + path_sep + cache_key.substr(4, 12) +
-		       ((type == BlobCacheType::SMALL_RANGE) ? 's' : 'l') + oss.str() + cache_key.substr(16);
+
+		if (type == BlobCacheType::SMALL_RANGE) {
+			// Small files: hash on ID only, not filename
+			// Subdir: file_id % 4095 in hex (4 chars)
+			idx_t subdir_hash = file_id % 4095;
+			oss << std::setw(4) << std::setfill('0') << std::hex << std::uppercase << subdir_hash;
+			string subdir = oss.str();
+			oss.str(""); // Clear stream
+
+			// Filename: "first{id}" or "small{id}" in decimal
+			oss << std::dec << (small_type == SmallFileType::FIRST ? "first" : "small") << file_id;
+
+			return blobcache_dir + subdir + path_sep + oss.str();
+		} else {
+			// Large range: use cache_key-based naming
+			oss << range_start << "_" << file_id;
+			return blobcache_dir + cache_key.substr(0, 4) + path_sep + cache_key.substr(4, 12) + oss.str() +
+			       cache_key.substr(16);
+		}
 	}
 
 	// cache_key(filename) = hex_hash64 ':' filename_suffix16 ':' protocol
@@ -193,17 +239,21 @@ struct BlobCacheConfig {
 //===----------------------------------------------------------------------===//
 struct BlobCacheMap {
 	BlobCacheConfig &config; // Reference to central configuration in BlobCache (includes parent_cache)
-	unique_ptr<unordered_map<string, unique_ptr<BlobCacheEntry>>> key_cache; // KV store
-	BlobCacheEntry *lru_head = nullptr, *lru_tail = nullptr;                 // LRU
+	unique_ptr<unordered_map<string, unique_ptr<BlobCacheEntry>>> key_cache;     // KV store: cache_key -> CacheEntry
+	unique_ptr<unordered_map<string, unique_ptr<BlobCacheFile>>> filepath_cache; // KV store: filepath -> CacheFile
+	BlobCacheFile *lru_head = nullptr, *lru_tail = nullptr;                      // LRU for CacheFiles
 	idx_t current_size = 0, num_ranges = 0, current_file_id = 0;
+	idx_t current_small_file_id = 10000000; // Counter for small file suffixes (starts at 10000000)
 
 	explicit BlobCacheMap(BlobCacheConfig &cfg)
-	    : config(cfg), key_cache(make_uniq<unordered_map<string, unique_ptr<BlobCacheEntry>>>()) {
+	    : config(cfg), key_cache(make_uniq<unordered_map<string, unique_ptr<BlobCacheEntry>>>()),
+	      filepath_cache(make_uniq<unordered_map<string, unique_ptr<BlobCacheFile>>>()) {
 	}
 
 	// Cache state management
 	void Clear() {
 		key_cache->clear();
+		filepath_cache->clear();
 		lru_head = nullptr;
 		lru_tail = nullptr;
 		current_size = 0;
@@ -221,26 +271,28 @@ struct BlobCacheMap {
 		if (it == key_cache->end()) {
 			auto new_entry = make_uniq<BlobCacheEntry>();
 			new_entry->filename = filename;
-			new_entry->file_id = ++current_file_id; // unique id (filename must be unique each time we cache a file)
-			config.LogDebug("Insert '" + cache_key + "' with file_id " + std::to_string(new_entry->file_id));
+			config.LogDebug("Insert cache_key '" + cache_key + "'");
 			cache_entry = new_entry.get();
 			(*key_cache)[cache_key] = std::move(new_entry);
-			AddToLRUFront(cache_entry);
 		} else if (it->second->filename == filename) { // collision if not equal
 			cache_entry = it->second.get();
-			TouchLRU(cache_entry);
 		}
 		return cache_entry; // nullptr if there is a collision and we cannot insert
 	}
+	// Get or create CacheFile for writing
+	// For small ranges: reuses current_small_file if it has space (<256KB), creates new one otherwise
+	// For large ranges: always creates a new CacheFile
+	BlobCacheFile *GetOrCreateCacheFile(BlobCacheEntry *cache_entry, const string &cache_key, BlobCacheType cache_type,
+	                                    idx_t range_start, idx_t range_size);
 	size_t EvictCacheKey(const string &cache_key, BlobCacheType cache_type);
-	bool EvictToCapacity(idx_t required_space, BlobCacheType cache_type, const string &exclude_filename = "");
+	bool EvictToCapacity(idx_t required_space, BlobCacheType cache_type, const string &exclude_cache_key = "");
 	void PurgeCacheForPatternChange(const vector<std::regex> &regexps, optional_ptr<FileOpener> opener,
 	                                BlobCacheType cache_type);
 
-	// LRU list management
-	void TouchLRU(BlobCacheEntry *cache_entry);
-	void RemoveFromLRU(BlobCacheEntry *cache_entry);
-	void AddToLRUFront(BlobCacheEntry *cache_entry);
+	// LRU list management (now operates on CacheFiles, not CacheEntries)
+	void TouchLRU(BlobCacheFile *cache_file);
+	void RemoveFromLRU(BlobCacheFile *cache_file);
+	void AddToLRUFront(BlobCacheFile *cache_file);
 
 	// File operations (operate on cache_filepath which includes s/l prefix)
 	void EnsureSubdirectoryExists(const string &cache_filepath);
@@ -340,7 +392,7 @@ struct BlobCache {
 	// Combined cache lookup and read - returns bytes read from cache, adjusts nr_bytes if needed
 	idx_t ReadFromCache(const string &cache_key, const string &filename, idx_t position, void *buf, idx_t &len);
 
-	bool EvictToCapacity(idx_t extra_bytes = 0, const string &exclude_filename = "");
+	bool EvictToCapacity(idx_t extra_bytes = 0, const string &exclude_cache_key = "");
 
 	void ConfigureCache(const string &directory, idx_t max_size_bytes = BlobCacheConfig::DEFAULT_CACHE_CAPACITY,
 	                    idx_t writer_threads = 1,
