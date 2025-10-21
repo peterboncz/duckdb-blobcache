@@ -1,7 +1,7 @@
 smartcache will intercept reads that go through httpfs, s3, hf, azure, r2 and gcp and will write what you read to a local file. Subsequent reads will be served from that.
 Hence, it is a local-disk (i.e., SSD) cache for cloud-based data, such as DuckLake tables.
 
-The SSD files in the cache further get RAM caching through the DuckDB buffer pool through a new instance of the DuckDB ExternalFileCache. note that that smartcache turns off the official ExternalFileCache in the database instance (automatic SET external_file_cache = false), in order to be able to intercept the traffic on external files. 
+The SSD files in the cache further get RAM caching through the DuckDB buffer pool through a new instance of the DuckDB ExternalFileCache. Note that that smartcache turns off the official ExternalFileCache in the database instance (automatic SET external_file_cache = false), in order to be able to intercept the traffic on external files. 
 
 smartcache actually maintains two caches: one for small read requests (<=16KB) and one for larger requests. The idea is that in parquet reads, meta-data reads are small, whereas data (column-chunks) are larger. Given the high latency of S3 requests, the small reads are more painful than the larger ones but cost almost no cache space. Therefore, small ranges should stay longer in the cache. 
 The large cache gets 90% of the capacity, the small cache gets everything not used by the large cache. This means that in a workload that also has many small reads, like many XML or JSON files, the small cache can get 100% (instead of the normal 10%). 
