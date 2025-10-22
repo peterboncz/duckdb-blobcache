@@ -155,10 +155,11 @@ static unique_ptr<GlobalTableFunctionState> BlobCacheStatsInitGlobal(ClientConte
 // Bind function for blobcache_stats
 static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
-	// Setup return schema - returns cache statistics with 10 columns
+	// Setup return schema - returns cache statistics with 11 columns
 	return_types.push_back(LogicalType::VARCHAR); // protocol
 	return_types.push_back(LogicalType::VARCHAR); // filename
 	return_types.push_back(LogicalType::VARCHAR); // cache_type
+	return_types.push_back(LogicalType::VARCHAR); // blobcache_file
 	return_types.push_back(LogicalType::BIGINT);  // blobcache_range_start
 	return_types.push_back(LogicalType::BIGINT);  // range_start
 	return_types.push_back(LogicalType::BIGINT);  // range_size
@@ -170,6 +171,7 @@ static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, Table
 	names.push_back("protocol");
 	names.push_back("filename");
 	names.push_back("cache_type");
+	names.push_back("blobcache_file");
 	names.push_back("blobcache_range_start");
 	names.push_back("range_start");
 	names.push_back("range_size");
@@ -276,13 +278,14 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 		output.data[0].SetValue(i, Value(info.protocol));
 		output.data[1].SetValue(i, Value(info.filename));
 		output.data[2].SetValue(i, Value(cache_type));
-		output.data[3].SetValue(i, Value::BIGINT(info.blobcache_range_start));
-		output.data[4].SetValue(i, Value::BIGINT(info.range_start));
-		output.data[5].SetValue(i, Value::BIGINT(info.range_size));
-		output.data[6].SetValue(i, Value::BIGINT(info.usage_count));
-		output.data[7].SetValue(i, Value::BIGINT(info.bytes_from_cache));
-		output.data[8].SetValue(i, Value::BIGINT(info.bytes_from_mem));
-		output.data[9].SetValue(i, Value::BIGINT(info.smallrange_id));
+		output.data[3].SetValue(i, Value(info.blobcache_file));
+		output.data[4].SetValue(i, Value::BIGINT(info.blobcache_range_start));
+		output.data[5].SetValue(i, Value::BIGINT(info.range_start));
+		output.data[6].SetValue(i, Value::BIGINT(info.range_size));
+		output.data[7].SetValue(i, Value::BIGINT(info.usage_count));
+		output.data[8].SetValue(i, Value::BIGINT(info.bytes_from_cache));
+		output.data[9].SetValue(i, Value::BIGINT(info.bytes_from_mem));
+		output.data[10].SetValue(i, Value::BIGINT(info.smallrange_id));
 	}
 	global_state.tuples_processed += chunk_size;
 }

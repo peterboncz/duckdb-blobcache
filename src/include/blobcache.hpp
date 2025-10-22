@@ -30,6 +30,7 @@ enum class BlobCacheType : uint8_t {
 struct BlobCacheRangeInfo {
 	string protocol;             // e.g., s3
 	string filename;             // original URL
+	string blobcache_file;       // cache file path where this range is stored
 	idx_t blobcache_range_start; // Offset in cache file where this range starts
 	idx_t range_start;           // Start position in remote file
 	idx_t range_size;            // Size of range (end - start in remote file)
@@ -92,8 +93,7 @@ struct BlobCacheFile {
 	std::atomic<bool> deleted;         // True when evicted (for lazy deletion)
 	BlobCacheFile *lru_prev = nullptr; // LRU linked list pointers
 	BlobCacheFile *lru_next = nullptr;
-	string cache_key;             // Cache key of primary CacheEntry (for exclude_filename logic)
-	idx_t last_smallrange_id = 0; // Last small range ID seen by this file handle (for tracking large ranges)
+	string cache_key; // Cache key of primary CacheEntry (for exclude_filename logic)
 
 	BlobCacheFile(string path, idx_t id, string key = "")
 	    : filepath(std::move(path)), file_id(id), deleted(false), cache_key(std::move(key)) {
@@ -280,7 +280,7 @@ struct BlobCacheMap {
 			key_cache->erase(it); // remove the orig filename from the map. LRU will eventually clean up the CacheFile
 		}
 	}
-	bool EvictToCapacity(idx_t required_space, const string &exclude_cache_key = "");
+	bool EvictToCapacity(idx_t required_space);
 	BlobCacheFile *GetOrCreateCacheFile(BlobCacheEntry *cache_entry, const string &cache_key, BlobCacheType cache_type,
 	                                    idx_t range_start, idx_t range_size);
 
@@ -336,7 +336,7 @@ struct BlobCache {
 
 	BlobCacheConfig config; // owns cache configuration settings
 	idx_t file_handle_id = 0;
-	std::atomic<idx_t> smallrange_id_counter {0}; // Global counter for small range IDs
+	std::atomic<idx_t> smallrange_id_counter {1}; // Global counter for small range IDs (start at 1, not 0)
 
 	// Cache maps for small and large ranges
 	mutable std::mutex blobcache_mutex; // Protects both caches, LRU lists, sizes
@@ -410,12 +410,14 @@ struct BlobCache {
 	}
 
 	// Core cache operations
-	void InsertCache(const string &cache_key, const string &filename, idx_t start_pos, void *buf, idx_t len);
-	// Combined cache lookup and read - returns bytes read from cache, adjusts nr_bytes if needed
-	idx_t ReadFromCache(const string &cache_key, const string &filename, idx_t position, void *buf, idx_t &len);
+	// Returns the assigned smallrange_id (0 if not a small range, or if insertion failed)
+	idx_t InsertCache(const string &cache_key, const string &filename, idx_t start_pos, void *buf, idx_t len,
+	                  idx_t file_handle_smallrange_id);
+	// Combined cache lookup and read - returns bytes read from cache, adjusts nr_bytes if needed, updates smallrange_id
+	idx_t ReadFromCache(const string &cache_key, const string &filename, idx_t position, void *buf, idx_t &len,
+	                    idx_t &file_handle_smallrange_id);
 
-	bool EvictToCapacity(BlobCacheType cache_type = BlobCacheType::LARGE_RANGE, idx_t new_range_size = 0,
-	                     const string &exclude_cache_key = "");
+	bool EvictToCapacity(BlobCacheType cache_type = BlobCacheType::LARGE_RANGE, idx_t new_range_size = 0);
 
 	void ConfigureCache(const string &directory, idx_t max_size_bytes = BlobCacheConfig::DEFAULT_CACHE_CAPACITY,
 	                    idx_t writer_threads = 1,
@@ -436,8 +438,10 @@ struct BlobCache {
 	}
 
 	// Internal helpers
-	void InsertRangeInternal(BlobCacheType cache_type, BlobCacheEntry *cache_entry, const string &cache_key,
-	                         const string &filename, idx_t range_start, idx_t range_end, const void *buffer);
+	// Returns the assigned smallrange_id (0 if not a small range)
+	idx_t InsertRangeInternal(BlobCacheType cache_type, BlobCacheEntry *cache_entry, const string &cache_key,
+	                          const string &filename, idx_t range_start, idx_t range_end, const void *buffer,
+	                          idx_t file_handle_smallrange_id);
 };
 
 } // namespace duckdb

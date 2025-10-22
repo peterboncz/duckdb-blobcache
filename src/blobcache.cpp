@@ -69,7 +69,8 @@ static BlobCacheFileRange *AnalyzeRange(map<idx_t, unique_ptr<BlobCacheFileRange
 	}
 }
 
-idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename, idx_t pos, void *buffer, idx_t &len) {
+idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename, idx_t pos, void *buffer, idx_t &len,
+                               idx_t &file_handle_smallrange_id) {
 	BlobCacheType cache_type = // Determine which blobcache to use based on request size
 	    (len < config.small_range_threshold) ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
 	idx_t position = pos;
@@ -98,6 +99,11 @@ idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename, 
 	idx_t offset = position - hit_range->range_start;
 	hit_range->bytes_from_cache += hit_size;
 	hit_range->usage_count++;
+
+	// Update file handle's last_smallrange_id if this is a small range
+	if (cache_type == BlobCacheType::SMALL_RANGE && hit_range->smallrange_id != 0) {
+		file_handle_smallrange_id = hit_range->smallrange_id;
+	}
 
 	// Copy data needed before unlocking
 	idx_t cached_blobcache_range_start = hit_range->blobcache_range_start;
@@ -128,9 +134,11 @@ idx_t BlobCache::ReadFromCache(const string &cache_key, const string &filename, 
 }
 
 // we had to read from the original source (e.g. S3). Now try to cache this buffer in the disk-based blobcache
-void BlobCache::InsertCache(const string &cache_key, const string &filename, idx_t pos, void *buffer, idx_t len) {
+// Returns the assigned smallrange_id (0 if not a small range, or if insertion failed)
+idx_t BlobCache::InsertCache(const string &cache_key, const string &filename, idx_t pos, void *buffer, idx_t len,
+                             idx_t file_handle_smallrange_id) {
 	if (!config.blobcache_initialized || len == 0 || len > config.total_cache_capacity) {
-		return;
+		return 0;
 	}
 	BlobCacheType cache_type = // Determine blobcache type based on original request size
 	    (len < config.small_range_threshold) ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
@@ -139,7 +147,7 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 	auto &cache_map = GetCacheMap(cache_type);
 	auto cache_entry = cache_map.UpsertFile(cache_key, filename);
 	if (!cache_entry) {
-		return; // name collision (rare)
+		return 0; // name collision (rare)
 	}
 	// Check (under lock) if range already cached (in the meantime, due to concurrent reads)
 	auto hit_range = AnalyzeRange(cache_entry->ranges, pos, len, cache_map.filepath_cache.get());
@@ -152,30 +160,27 @@ void BlobCache::InsertCache(const string &cache_key, const string &filename, idx
 		actual_bytes = range_end - range_start;
 	}
 	if (actual_bytes == 0) {
-		return; // nothing to cache
+		return 0; // nothing to cache
 	}
-	// Don't protect cache_key during eviction - let LRU work naturally.
-	// The original protection caused a bug: when a file is larger than cache capacity,
-	// all existing ranges from that file get protected, preventing eviction.
-	// This causes the cache to fill up and refuse new insertions.
-	if (!EvictToCapacity(cache_type, actual_bytes, "")) {
+	if (!EvictToCapacity(cache_type, actual_bytes)) {
 		config.LogError("InsertCache: EvictToCapacity failed for " + to_string(actual_bytes) +
 		                " bytes (cache_type=" + (cache_type == BlobCacheType::LARGE_RANGE ? "large" : "small") +
 		                ", large_size=" + to_string(largerange_blobcache->current_cache_size) +
 		                ", small_size=" + to_string(smallrange_blobcache->current_cache_size) + ")");
-		return; // failed to make room
+		return 0; // failed to make room
 	}
-	InsertRangeInternal(cache_type, cache_entry, cache_key, filename, range_start, range_end,
-	                    ((char *)buffer) + offset);
+	return InsertRangeInternal(cache_type, cache_entry, cache_key, filename, range_start, range_end,
+	                           ((char *)buffer) + offset, file_handle_smallrange_id);
 }
 
-void BlobCache::InsertRangeInternal(BlobCacheType cache_type, BlobCacheEntry *blobcache_entry, const string &cache_key,
-                                    const string &filename, idx_t range_start, idx_t range_end, const void *buffer) {
+idx_t BlobCache::InsertRangeInternal(BlobCacheType cache_type, BlobCacheEntry *blobcache_entry, const string &cache_key,
+                                     const string &filename, idx_t range_start, idx_t range_end, const void *buffer,
+                                     idx_t file_handle_smallrange_id) {
 	idx_t actual_bytes = range_end - range_start;
 	BufferHandle buffer_handle;
 	if (!AllocateInMemCache(buffer_handle, actual_bytes)) {
 		config.LogError("InsertRangeInternal: AllocateInMemCache failed for " + to_string(actual_bytes) + " bytes");
-		return; // allocation from DDB buffer pool failed
+		return 0; // allocation from DDB buffer pool failed
 	}
 	std::memcpy(buffer_handle.Ptr(), static_cast<const char *>(buffer), actual_bytes);
 
@@ -185,7 +190,7 @@ void BlobCache::InsertRangeInternal(BlobCacheType cache_type, BlobCacheEntry *bl
 	    blobcache_map.GetOrCreateCacheFile(blobcache_entry, cache_key, cache_type, range_start, actual_bytes);
 	if (!cache_file) {
 		config.LogError("InsertRangeInternal: failed to get or create cache file");
-		return;
+		return 0;
 	}
 
 	// Create new range and update stats
@@ -198,13 +203,14 @@ void BlobCache::InsertRangeInternal(BlobCacheType cache_type, BlobCacheEntry *bl
 	blobcache_map.num_ranges++;
 
 	// Assign smallrange_id
+	idx_t assigned_smallrange_id = 0;
 	if (cache_type == BlobCacheType::SMALL_RANGE) {
-		// For small ranges: assign unique ID and update file handle's last_smallrange_id
-		range_ptr->smallrange_id = smallrange_id_counter.fetch_add(1, std::memory_order_relaxed);
-		cache_file->last_smallrange_id = range_ptr->smallrange_id;
+		// For small ranges: assign unique ID (will be updated in file handle by caller)
+		assigned_smallrange_id = smallrange_id_counter.fetch_add(1, std::memory_order_relaxed);
+		range_ptr->smallrange_id = assigned_smallrange_id;
 	} else {
-		// For large ranges: capture the last small range ID from the file handle
-		range_ptr->smallrange_id = cache_file->last_smallrange_id;
+		// For large ranges: use the last small range ID from the file handle
+		range_ptr->smallrange_id = file_handle_smallrange_id;
 	}
 
 	// Pre-compute blobcache_range_start (offset in CacheFile where this range will be written)
@@ -222,6 +228,8 @@ void BlobCache::InsertRangeInternal(BlobCacheType cache_type, BlobCacheEntry *bl
 	range_ptr->memcache_buffer = file_buffer;
 	idx_t partition = cache_file->file_id % num_io_threads;
 	QueueIOWrite(blobcache_filepath, partition, file_buffer);
+
+	return assigned_smallrange_id; // Return the ID for small ranges, 0 for large ranges
 }
 
 //===----------------------------------------------------------------------===//
@@ -369,7 +377,8 @@ void BlobCache::ProcessReadJob(const BlobCacheReadJob &job) {
 		fs.Read(*handle, buffer.get(), job.range_size, job.range_start);
 
 		// Insert into cache (this will queue a write job)
-		InsertCache(job.cache_key, job.filename, job.range_start, buffer.get(), job.range_size);
+		// Note: background prefetch jobs don't have a file handle, so pass 0 for last_smallrange_id
+		InsertCache(job.cache_key, job.filename, job.range_start, buffer.get(), job.range_size, 0);
 	} catch (const std::exception &e) {
 		config.LogError("ProcessReadJob: failed to read '" + job.filename + "' at " + to_string(job.range_start) +
 		                ": " + string(e.what()));
@@ -442,7 +451,7 @@ BlobCacheFile *BlobCacheMap::GetOrCreateCacheFile(BlobCacheEntry *cache_entry, c
 // BlobCacheMap - eviction logic
 //===----------------------------------------------------------------------===//
 
-bool BlobCacheMap::EvictToCapacity(idx_t required_space, const string &exclude_cache_key) {
+bool BlobCacheMap::EvictToCapacity(idx_t required_space) {
 	// Try to evict CacheFiles to make space, returns true if successful
 	// Note: This is called with blobcache_mutex already held
 	idx_t freed_space = 0;
@@ -462,14 +471,6 @@ bool BlobCacheMap::EvictToCapacity(idx_t required_space, const string &exclude_c
 
 		// Save next candidate before we potentially evict current
 		auto *next_to_try = current->lru_prev;
-
-		// Skip if this CacheFile belongs to the cache_key we're currently inserting
-		if (!exclude_cache_key.empty() && current->cache_key == exclude_cache_key) {
-			config.LogDebug("EvictToCapacity: skipping CacheFile for excluded cache_key '" + exclude_cache_key + "'");
-			files_skipped_excluded++;
-			current = next_to_try; // Move to next file in LRU
-			continue;
-		}
 
 		// Evict this CacheFile
 		idx_t evicted_bytes = current->current_file_size;
@@ -506,9 +507,9 @@ bool BlobCacheMap::EvictToCapacity(idx_t required_space, const string &exclude_c
 		config.LogError(
 		    "EvictToCapacity: needed " + std::to_string(required_space) + " bytes but only freed " +
 		    std::to_string(freed_space) + " bytes (current_cache_size=" + std::to_string(current_cache_size) +
-		    ", total_files=" + std::to_string(total_files) + ", exclude_cache_key='" + exclude_cache_key +
-		    "', files_checked=" + std::to_string(files_checked) + ", files_skipped_empty=" +
-		    std::to_string(files_skipped_empty) + ", files_skipped_excluded=" + std::to_string(files_skipped_excluded) +
+		    ", total_files=" + std::to_string(total_files) + "', files_checked=" + std::to_string(files_checked) +
+		    ", files_skipped_empty=" + std::to_string(files_skipped_empty) +
+		    ", files_skipped_excluded=" + std::to_string(files_skipped_excluded) +
 		    ", lru_head=" + (lru_head ? "present" : "null") + ", lru_tail=" + (lru_tail ? "present" : "null") + ")");
 		return false;
 	}
@@ -536,6 +537,7 @@ BlobCacheMap::GetStatistics() const { // produce list of cached ranges for blobc
 			if (IsRangeStale(range_pair.second.get(), filepath_cache.get())) {
 				continue;
 			}
+			info.blobcache_file = range_pair.second->cache_filepath;
 			info.blobcache_range_start = range_pair.second->blobcache_range_start;
 			info.range_start = range_pair.second->range_start;
 			info.range_size = range_pair.second->range_end - range_pair.second->range_start;
@@ -647,7 +649,7 @@ bool BlobCacheMap::DeleteCacheFile(const string &cache_filepath) {
 // BlobCache eviction from both (small,large) range caches
 //===----------------------------------------------------------------------===//
 
-bool BlobCache::EvictToCapacity(BlobCacheType cache_type, idx_t new_range_size, const string &exclude_cache_key) {
+bool BlobCache::EvictToCapacity(BlobCacheType cache_type, idx_t new_range_size) {
 	/* CRITICAL REASONING - DO NOT MODIFY WITHOUT UNDERSTANDING THIS LOGIC:
 	 *
 	 * Small and large caches share the SAME total capacity pool (e.g., 1GB total).
@@ -667,8 +669,8 @@ bool BlobCache::EvictToCapacity(BlobCacheType cache_type, idx_t new_range_size, 
 	if (cache_type == BlobCacheType::LARGE_RANGE) {
 		idx_t large_cap = GetCacheCapacity(BlobCacheType::LARGE_RANGE);
 		if (largerange_blobcache->current_cache_size + new_range_size > large_cap) {
-			if (!largerange_blobcache->EvictToCapacity(
-			        largerange_blobcache->current_cache_size + new_range_size - large_cap, exclude_cache_key)) {
+			if (!largerange_blobcache->EvictToCapacity(largerange_blobcache->current_cache_size + new_range_size -
+			                                           large_cap)) {
 				result = false;
 			} else {
 				new_range_size = 0; // we have made space, but still will check small cache
@@ -677,8 +679,8 @@ bool BlobCache::EvictToCapacity(BlobCacheType cache_type, idx_t new_range_size, 
 	}
 	idx_t small_cap = GetCacheCapacity(BlobCacheType::SMALL_RANGE);
 	if (smallrange_blobcache->current_cache_size + new_range_size > small_cap) {
-		result &= smallrange_blobcache->EvictToCapacity(
-		    smallrange_blobcache->current_cache_size + new_range_size - small_cap, exclude_cache_key);
+		result &= smallrange_blobcache->EvictToCapacity(smallrange_blobcache->current_cache_size + new_range_size -
+		                                                small_cap);
 	}
 	return result;
 }

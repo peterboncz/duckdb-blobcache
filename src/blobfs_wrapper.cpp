@@ -27,7 +27,7 @@ static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_hand
 	                                   ", path=" + blob_handle.original_path + ", location=" + to_string(location) +
 	                                   ", max_nr_bytes=" + to_string(max_nr_bytes) + ")");
 	idx_t nr_bytes = blob_handle.cache->ReadFromCache(blob_handle.cache_key, blob_handle.original_path, location,
-	                                                  buffer, max_nr_bytes);
+	                                                  buffer, max_nr_bytes, blob_handle.last_smallrange_id);
 #if 0
     if (nr_bytes > 0) { // debug
 		char *tmp_buffer = new char[nr_bytes];
@@ -46,7 +46,13 @@ static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &blob_hand
 		idx_t nr_read = max_nr_bytes - nr_bytes;
 		wrapped_fs.Seek(*blob_handle.wrapped_handle, location);
 		nr_read = wrapped_fs.Read(*blob_handle.wrapped_handle, buffer, nr_read);
-		blob_handle.cache->InsertCache(blob_handle.cache_key, blob_handle.original_path, location, buffer, nr_read);
+		idx_t new_smallrange_id =
+		    blob_handle.cache->InsertCache(blob_handle.cache_key, blob_handle.original_path, location, buffer, nr_read,
+		                                   blob_handle.last_smallrange_id);
+		if (new_smallrange_id != 0) {
+			// Update file handle's last_smallrange_id if a small range was inserted
+			blob_handle.last_smallrange_id = new_smallrange_id;
+		}
 		if (nr_read && blob_handle.cache_key.substr(blob_handle.cache_key.find_last_of(':')) == ":fakes3") {
 			// inspired on AnyBlob paper: lowest latency is 20ms, transfer 12MB/s for the first MB, 40MB/s beyond that
 			uint64_t ms = (nr_read < (1 << 20)) ? (20 + ((80 * nr_read) >> 20)) : (75 + ((25 * nr_read) >> 20));

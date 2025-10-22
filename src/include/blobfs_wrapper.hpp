@@ -45,7 +45,7 @@ public:
 	               shared_ptr<BlobCache> cache)
 	    : FileHandle(fs, wrapped_handle->GetPath(), wrapped_handle->GetFlags()),
 	      wrapped_handle(std::move(wrapped_handle)), cache_key(std::move(cache_key)), cache(cache),
-	      original_path(std::move(original_path)), file_position(0) {
+	      original_path(std::move(original_path)), file_position(0), last_smallrange_id(0) {
 		file_handle_id = cache->file_handle_id++; // TODO: should be an atomic increment
 	}
 
@@ -61,9 +61,10 @@ public:
 	unique_ptr<FileHandle> wrapped_handle;
 	string cache_key;
 	shared_ptr<BlobCache> cache;
-	string original_path; // Store original path with protocol prefix
-	idx_t file_position;  // Track our own file position
-	idx_t file_handle_id;
+	string original_path;     // Store original path with protocol prefix
+	idx_t file_position;      // Track our own file position
+	idx_t file_handle_id;     // Used to identify file handles so we can xref them with reads/writes
+	idx_t last_smallrange_id; // Last small range ID that was read via this handle
 };
 
 //===----------------------------------------------------------------------===//
