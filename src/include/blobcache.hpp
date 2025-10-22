@@ -20,10 +20,6 @@ namespace duckdb {
 // Forward declarations
 struct BlobCache;
 
-//===----------------------------------------------------------------------===//
-// Cache data structures
-//===----------------------------------------------------------------------===//
-
 // Cache type for dual-cache system
 enum class BlobCacheType : uint8_t {
 	SMALL_RANGE = 0, // Small ranges (default <= 2047 bytes)
@@ -40,6 +36,7 @@ struct BlobCacheRangeInfo {
 	idx_t usage_count;           // how often it was read from the cache
 	idx_t bytes_from_cache;      // disk bytes read from CacheFile
 	idx_t bytes_from_mem;        // memory bytes read from this cached range
+	idx_t smallrange_id;         // For small ranges: unique ID; for large ranges: last small range ID
 };
 
 // BlobCacheFileBuffer - shared buffer for background write
@@ -95,7 +92,8 @@ struct BlobCacheFile {
 	std::atomic<bool> deleted;         // True when evicted (for lazy deletion)
 	BlobCacheFile *lru_prev = nullptr; // LRU linked list pointers
 	BlobCacheFile *lru_next = nullptr;
-	string cache_key; // Cache key of primary CacheEntry (for exclude_filename logic)
+	string cache_key;             // Cache key of primary CacheEntry (for exclude_filename logic)
+	idx_t last_smallrange_id = 0; // Last small range ID seen by this file handle (for tracking large ranges)
 
 	BlobCacheFile(string path, idx_t id, string key = "")
 	    : filepath(std::move(path)), file_id(id), deleted(false), cache_key(std::move(key)) {
@@ -115,7 +113,7 @@ struct BlobCacheFileRange {
 	string cache_filepath;                                   // Path to cache file (for lookup in filepath_cache)
 
 	BlobCacheFileRange(idx_t start, idx_t end)
-	    : range_start(start), range_end(end), blobcache_range_start(0), disk_write_completed(false) {
+	    : smallrange_id(0), range_start(start), range_end(end), blobcache_range_start(0), disk_write_completed(false) {
 	}
 };
 
@@ -169,13 +167,32 @@ struct BlobCacheConfig {
 		if (!fs.DirectoryExists(blobcache_dir)) {
 			try {
 				fs.CreateDirectory(blobcache_dir);
-				return true;
 			} catch (const std::exception &e) {
 				LogError("Failed to create cache directory: " + string(e.what()));
 				return false;
 			}
+		} else {
+			if (!CleanCacheDir()) {
+				return false;
+			}
 		}
-		return CleanCacheDir();
+		// Pre-create all 4096 subdirectories (0x0000 to 0x0FFF)
+		LogDebug("InitCacheDir: pre-creating 4096 subdirectories");
+		for (idx_t i = 0; i < 4096; i++) {
+			std::ostringstream oss;
+			oss << blobcache_dir << "/" << std::hex << std::setw(4) << std::setfill('0') << i;
+			string subdir_path = oss.str();
+			try {
+				if (!fs.DirectoryExists(subdir_path)) {
+					fs.CreateDirectory(subdir_path);
+				}
+			} catch (const std::exception &e) {
+				LogError("Failed to create subdirectory '" + subdir_path + "': " + string(e.what()));
+				return false;
+			}
+		}
+		LogDebug("InitCacheDir: successfully created all subdirectories");
+		return true;
 	}
 	// Naming scheme:
 	// Small files:  /blobcache_dir/{id%4095 in 4-char hex}/{id}
@@ -300,7 +317,6 @@ struct BlobCacheMap {
 	}
 
 	// File operations (operate on cache_filepath which includes s/l prefix)
-	void EnsureSubdirectoryExists(const string &cache_filepath, bool force = false);
 	unique_ptr<FileHandle> TryOpenCacheFile(const string &cache_filepath);
 	bool WriteToCacheFile(const string &blobcache_filepath, const void *buffer, idx_t length,
 	                      idx_t &blobcache_range_start);
@@ -320,6 +336,7 @@ struct BlobCache {
 
 	BlobCacheConfig config; // owns cache configuration settings
 	idx_t file_handle_id = 0;
+	std::atomic<idx_t> smallrange_id_counter {0}; // Global counter for small range IDs
 
 	// Cache maps for small and large ranges
 	mutable std::mutex blobcache_mutex; // Protects both caches, LRU lists, sizes
@@ -409,10 +426,6 @@ struct BlobCache {
 	void UpdateRegexPatterns(const string &regex_patterns_str);
 
 	// helpers that delegate to BlobCacheMap on both smaller and larger
-	void Clear() {
-		smallrange_blobcache->Clear();
-		largerange_blobcache->Clear();
-	}
 	void EvictFile(const string &filename) { // Evict from both caches
 		if (!config.blobcache_initialized) {
 			return;
@@ -425,8 +438,6 @@ struct BlobCache {
 	// Internal helpers
 	void InsertRangeInternal(BlobCacheType cache_type, BlobCacheEntry *cache_entry, const string &cache_key,
 	                         const string &filename, idx_t range_start, idx_t range_end, const void *buffer);
-	idx_t ReadFromCacheInternal(BlobCacheType cache_type, const string &cache_key, const string &filename,
-	                            idx_t position, void *buffer, idx_t &max_nr_bytes);
 };
 
 } // namespace duckdb

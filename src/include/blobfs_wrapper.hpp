@@ -229,33 +229,33 @@ private:
 	shared_ptr<BlobCache> cache;
 };
 
-class DebugFileSystem : public LocalFileSystem {
+class FakeS3FileSystem : public LocalFileSystem {
 public:
-	DebugFileSystem() : LocalFileSystem() {
+	FakeS3FileSystem() : LocalFileSystem() {
 	}
-	~DebugFileSystem() override = default;
+	~FakeS3FileSystem() override = default;
 
-	// Override to claim we can handle debug:// URLs
+	// Override to claim we can handle fakes3:// URLs
 	bool CanHandleFile(const string &fpath) override {
-		return StringUtil::StartsWith(StringUtil::Lower(fpath), "debug://");
+		return StringUtil::StartsWith(StringUtil::Lower(fpath), "fakes3://");
 	}
 
-	// Override GetName to identify as debug filesystem
+	// Override GetName to identify as fakes3:// filesystem
 	string GetName() const override {
-		return "debug";
+		return "fakes3";
 	}
 
-	// Override FileExists to handle debug:// URLs
+	// Override FileExists to handle fakes3:// URLs
 	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override {
-		string actual_path = StripDebugPrefix(filename);
+		string actual_path = StripFakeS3Prefix(filename);
 		return LocalFileSystem::FileExists(actual_path, opener);
 	}
 
-	// Override OpenFile to strip debug:// prefix
+	// Override OpenFile to strip fakes3:// prefix
 	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
 	                                optional_ptr<FileOpener> opener = nullptr) override {
-		// Strip debug:// prefix to get actual local path
-		string actual_path = StripDebugPrefix(path);
+		// Strip fakes3:// prefix to get actual local path
+		string actual_path = StripFakeS3Prefix(path);
 
 		// Call parent implementation with actual path
 		return LocalFileSystem::OpenFile(actual_path, flags, opener);
@@ -263,22 +263,22 @@ public:
 
 	// Override Glob to strip prefix for search, then re-add to results
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override {
-		string actual_path = StripDebugPrefix(path);
+		string actual_path = StripFakeS3Prefix(path);
 		auto results = LocalFileSystem::Glob(actual_path, opener);
 
-		// Re-add debug:// prefix to all returned paths so subsequent reads use debug filesystem
+		// Re-add fakes3:// prefix to all returned paths so subsequent reads use fakes3 filesystem
 		for (auto &info : results) {
-			info.path = "debug://" + info.path;
+			info.path = "fakes3://" + info.path;
 		}
 
 		return results;
 	}
 
 private:
-	// Helper method to strip debug:// prefix
-	string StripDebugPrefix(const string &path) {
-		if (StringUtil::StartsWith(StringUtil::Lower(path), "debug://")) {
-			return path.substr(8);
+	// Helper method to strip fakes3:// prefix
+	string StripFakeS3Prefix(const string &path) {
+		if (StringUtil::StartsWith(StringUtil::Lower(path), "fakes3://")) {
+			return path.substr(9);
 		}
 		return path;
 	}

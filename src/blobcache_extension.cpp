@@ -155,7 +155,7 @@ static unique_ptr<GlobalTableFunctionState> BlobCacheStatsInitGlobal(ClientConte
 // Bind function for blobcache_stats
 static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
-	// Setup return schema - returns cache statistics with 9 columns
+	// Setup return schema - returns cache statistics with 10 columns
 	return_types.push_back(LogicalType::VARCHAR); // protocol
 	return_types.push_back(LogicalType::VARCHAR); // filename
 	return_types.push_back(LogicalType::VARCHAR); // cache_type
@@ -165,6 +165,7 @@ static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, Table
 	return_types.push_back(LogicalType::BIGINT);  // usage_count
 	return_types.push_back(LogicalType::BIGINT);  // bytes_from_cache
 	return_types.push_back(LogicalType::BIGINT);  // bytes_from_mem
+	return_types.push_back(LogicalType::BIGINT);  // smallrange_id
 
 	names.push_back("protocol");
 	names.push_back("filename");
@@ -175,6 +176,7 @@ static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, Table
 	names.push_back("usage_count");
 	names.push_back("bytes_from_cache");
 	names.push_back("bytes_from_mem");
+	names.push_back("smallrange_id");
 
 	return nullptr; // No bind data needed for stats function
 }
@@ -280,6 +282,7 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 		output.data[6].SetValue(i, Value::BIGINT(info.usage_count));
 		output.data[7].SetValue(i, Value::BIGINT(info.bytes_from_cache));
 		output.data[8].SetValue(i, Value::BIGINT(info.bytes_from_mem));
+		output.data[9].SetValue(i, Value::BIGINT(info.smallrange_id));
 	}
 	global_state.tuples_processed += chunk_size;
 }

@@ -19,7 +19,7 @@ statement ok
 copy lineitem to 'lineitem.parquet';
 
 statement ok
-select max(l_comment) from read_parquet('debug://lineitem.parquet');
+select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
 
 query III
 select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
@@ -28,7 +28,7 @@ large	16	0
 small	16	1
 
 statement ok
-select max(l_comment) from read_parquet('debug://lineitem.parquet');
+select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
 
 query III
 select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
@@ -44,7 +44,7 @@ large	1
 small	1
 
 statement ok
-select max(l_comment) from read_parquet('debug://lineitem.parquet');
+select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
 
 query III
 select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
@@ -75,7 +75,7 @@ select * replace(substr(cache_path,0,12) as cache_path) from blobcache_config();
 
 # Run a query to populate the new cache
 statement ok
-select max(l_comment) from read_parquet('debug://lineitem.parquet');
+select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
 
 # Verify new cache is populated
 query I
@@ -95,7 +95,7 @@ select current_setting('enable_external_file_cache');
 
 # Run a query through our cache
 statement ok
-select max(l_comment) from read_parquet('debug://lineitem.parquet');
+select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
 
 # DuckDB's external file cache should be EMPTY (Parquet bypasses it)
 query I
