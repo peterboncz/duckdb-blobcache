@@ -41,12 +41,11 @@ public:
 //===----------------------------------------------------------------------===//
 class BlobFileHandle : public FileHandle {
 public:
-	BlobFileHandle(FileSystem &fs, string original_path, unique_ptr<FileHandle> wrapped_handle, string cache_key,
+	BlobFileHandle(FileSystem &fs, string original_path, unique_ptr<FileHandle> wrapped_handle, string key,
 	               shared_ptr<BlobCache> cache)
 	    : FileHandle(fs, wrapped_handle->GetPath(), wrapped_handle->GetFlags()),
-	      wrapped_handle(std::move(wrapped_handle)), cache_key(std::move(cache_key)), cache(cache),
-	      original_path(std::move(original_path)), file_position(0), last_smallrange_id(0) {
-		file_handle_id = cache->file_handle_id++; // TODO: should be an atomic increment
+	      wrapped_handle(std::move(wrapped_handle)), cache(cache), uri(std::move(original_path)), key(std::move(key)),
+	      file_position(0), prev_smallrange() {
 	}
 
 	~BlobFileHandle() override = default;
@@ -59,12 +58,9 @@ public:
 
 public:
 	unique_ptr<FileHandle> wrapped_handle;
-	string cache_key;
 	shared_ptr<BlobCache> cache;
-	string original_path;     // Store original path with protocol prefix
-	idx_t file_position;      // Track our own file position
-	idx_t file_handle_id;     // Used to identify file handles so we can xref them with reads/writes
-	idx_t last_smallrange_id; // Last small range ID that was read via this handle
+	string uri, key;     // original uri, and hashmap key derived from it
+	idx_t file_position; // Track our own file position
 };
 
 //===----------------------------------------------------------------------===//
@@ -90,12 +86,12 @@ public:
 	int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
 	void Truncate(FileHandle &handle, int64_t new_size) override;
 	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override;
-	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
-	bool TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override {
+	void RemoveFile(const string &uri, optional_ptr<FileOpener> opener = nullptr) override;
+	bool TryRemoveFile(const string &uri, optional_ptr<FileOpener> opener = nullptr) override {
 		if (cache) {
-			cache->EvictFile(filename);
+			cache->EvictFile(uri);
 		}
-		return wrapped_fs->TryRemoveFile(filename, opener);
+		return wrapped_fs->TryRemoveFile(uri, opener);
 	}
 	bool Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) override {
 		auto &blob_handle = handle.Cast<BlobFileHandle>();
@@ -163,11 +159,11 @@ public:
 	               FileOpener *opener = nullptr) override {
 		return wrapped_fs->ListFiles(directory, callback, opener);
 	}
-	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override {
-		return wrapped_fs->FileExists(filename, opener);
+	bool FileExists(const string &uri, optional_ptr<FileOpener> opener = nullptr) override {
+		return wrapped_fs->FileExists(uri, opener);
 	}
-	bool IsPipe(const string &filename, optional_ptr<FileOpener> opener = nullptr) override {
-		return wrapped_fs->IsPipe(filename, opener);
+	bool IsPipe(const string &uri, optional_ptr<FileOpener> opener = nullptr) override {
+		return wrapped_fs->IsPipe(uri, opener);
 	}
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override {
 		return wrapped_fs->Glob(path, opener);
@@ -216,15 +212,6 @@ public:
 		return wrapped_fs->OpenCompressedFile(context, std::move(handle), write);
 	}
 
-	// Statistics helper
-	static string GetProtocolFromKey(const string &cache_key) {
-		auto suffix_pos = cache_key.rfind(':');
-		if (suffix_pos != string::npos) {
-			return cache_key.substr(suffix_pos + 1);
-		}
-		return "";
-	}
-
 private:
 	unique_ptr<FileSystem> wrapped_fs;
 	shared_ptr<BlobCache> cache;
@@ -247,25 +234,25 @@ public:
 	}
 
 	// Override FileExists to handle fakes3:// URLs
-	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override {
-		string actual_path = StripFakeS3Prefix(filename);
+	bool FileExists(const string &uri, optional_ptr<FileOpener> opener = nullptr) override {
+		string actual_path = StripFakeS3Prefix(uri);
 		return LocalFileSystem::FileExists(actual_path, opener);
 	}
 
 	// Override OpenFile to strip fakes3:// prefix
-	unique_ptr<FileHandle> OpenFile(const string &path, FileOpenFlags flags,
+	unique_ptr<FileHandle> OpenFile(const string &uri, FileOpenFlags flags,
 	                                optional_ptr<FileOpener> opener = nullptr) override {
 		// Strip fakes3:// prefix to get actual local path
-		string actual_path = StripFakeS3Prefix(path);
+		string file_path = StripFakeS3Prefix(uri);
 
 		// Call parent implementation with actual path
-		return LocalFileSystem::OpenFile(actual_path, flags, opener);
+		return LocalFileSystem::OpenFile(file_path, flags, opener);
 	}
 
 	// Override Glob to strip prefix for search, then re-add to results
-	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override {
-		string actual_path = StripFakeS3Prefix(path);
-		auto results = LocalFileSystem::Glob(actual_path, opener);
+	vector<OpenFileInfo> Glob(const string &uri, FileOpener *opener = nullptr) override {
+		string file_path = StripFakeS3Prefix(uri);
+		auto results = LocalFileSystem::Glob(file_path, opener);
 
 		// Re-add fakes3:// prefix to all returned paths so subsequent reads use fakes3 filesystem
 		for (auto &info : results) {
@@ -277,11 +264,11 @@ public:
 
 private:
 	// Helper method to strip fakes3:// prefix
-	string StripFakeS3Prefix(const string &path) {
-		if (StringUtil::StartsWith(StringUtil::Lower(path), "fakes3://")) {
-			return path.substr(9);
+	string StripFakeS3Prefix(const string &uri) {
+		if (StringUtil::StartsWith(StringUtil::Lower(uri), "fakes3://")) {
+			return uri.substr(9);
 		}
-		return path;
+		return uri;
 	}
 };
 

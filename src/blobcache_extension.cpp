@@ -15,27 +15,24 @@ namespace duckdb {
 struct BlobCacheConfigBindData : public FunctionData {
 	string directory;
 	idx_t max_size_mb;
-	idx_t writer_threads;
-	string regex_patterns;      // New regex patterns parameter
-	idx_t smallrange_threshold; // Small range threshold parameter
-	bool query_only;            // True if no parameters provided - just query current values
+	idx_t nr_io_threads;
+	string regex_patterns; // New regex patterns parameter
+	bool query_only;       // True if no parameters provided - just query current values
 
-	BlobCacheConfigBindData(string dir, idx_t size, idx_t threads, string regexps = "", idx_t threshold = 2047,
-	                        bool query = false)
-	    : directory(std::move(dir)), max_size_mb(size), writer_threads(threads), regex_patterns(std::move(regexps)),
-	      smallrange_threshold(threshold), query_only(query) {
+	BlobCacheConfigBindData(string dir, idx_t size, idx_t threads, string regexps = "", bool query = false)
+	    : directory(std::move(dir)), max_size_mb(size), nr_io_threads(threads), regex_patterns(std::move(regexps)),
+	      query_only(query) {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<BlobCacheConfigBindData>(directory, max_size_mb, writer_threads, regex_patterns,
-		                                          smallrange_threshold, query_only);
+		return make_uniq<BlobCacheConfigBindData>(directory, max_size_mb, nr_io_threads, regex_patterns, query_only);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<BlobCacheConfigBindData>();
 		return directory == other.directory && max_size_mb == other.max_size_mb &&
-		       writer_threads == other.writer_threads && regex_patterns == other.regex_patterns &&
-		       smallrange_threshold == other.smallrange_threshold && query_only == other.query_only;
+		       nr_io_threads == other.nr_io_threads && regex_patterns == other.regex_patterns &&
+		       query_only == other.query_only;
 	}
 };
 
@@ -49,6 +46,11 @@ struct BlobCacheGlobalState : public GlobalTableFunctionState {
 	}
 };
 
+void default_cache_sizes(DatabaseInstance &db, idx_t &max_size_mb, idx_t &nr_io_threads) {
+	max_size_mb = db.NumberOfThreads() * 4096; // 4GB * threads
+	nr_io_threads = std::min<idx_t>(256, db.NumberOfThreads());
+}
+
 // Bind function for blobcache_config
 static unique_ptr<FunctionData> BlobCacheConfigBind(ClientContext &context, TableFunctionBindInput &input,
                                                     vector<LogicalType> &return_types, vector<string> &names) {
@@ -56,21 +58,20 @@ static unique_ptr<FunctionData> BlobCacheConfigBind(ClientContext &context, Tabl
 	return_types.push_back(LogicalType::VARCHAR); // cache_path
 	return_types.push_back(LogicalType::BIGINT);  // max_size_bytes
 	return_types.push_back(LogicalType::BIGINT);  // current_size_bytes
-	return_types.push_back(LogicalType::BIGINT);  // writer_threads
+	return_types.push_back(LogicalType::BIGINT);  // io_threads
 	return_types.push_back(LogicalType::BOOLEAN); // success
 
 	names.push_back("cache_path");
 	names.push_back("max_size_bytes");
 	names.push_back("current_size_bytes");
-	names.push_back("writer_threads");
+	names.push_back("nr_io_threads");
 	names.push_back("success");
 
-	string directory = ".blobcache";    // Default
-	idx_t max_size_mb = 256;            // Default 256MB
-	idx_t writer_threads = 1;           // Default 1 thread
-	string regex_patterns = "";         // Default empty (conservative mode)
-	idx_t small_range_threshold = 2047; // Default 2047 bytes
-	bool query_only = false;            // Default to configuration mode
+	bool query_only = false;         // Default to configuration mode
+	string directory = ".blobcache"; // Default
+	string regex_patterns = "";      // Default empty (conservative mode)
+	idx_t max_size_mb, nr_io_threads;
+	default_cache_sizes(*context.db, max_size_mb, nr_io_threads);
 
 	// Check if this is a query-only call (no parameters)
 	if (input.inputs.size() == 0) {
@@ -98,18 +99,18 @@ static unique_ptr<FunctionData> BlobCacheConfigBind(ClientContext &context, Tabl
 
 	if (input.inputs.size() >= 3) {
 		if (input.inputs[2].IsNull()) {
-			throw BinderException("blobcache_config: writer_threads cannot be NULL");
+			throw BinderException("blobcache_config: nr_io_threads cannot be NULL");
 		}
 		auto threads_val = input.inputs[2];
 		if (threads_val.type().id() != LogicalTypeId::BIGINT && threads_val.type().id() != LogicalTypeId::INTEGER) {
-			throw BinderException("blobcache_config: writer_threads must be an integer");
+			throw BinderException("blobcache_config: nr_io_threads must be an integer");
 		}
-		writer_threads = threads_val.GetValue<idx_t>();
-		if (writer_threads <= 0) {
-			throw BinderException("blobcache_config: writer_threads must be positive");
+		nr_io_threads = threads_val.GetValue<idx_t>();
+		if (nr_io_threads <= 0) {
+			throw BinderException("blobcache_config: nr_io_threads must be positive");
 		}
-		if (writer_threads > 256) {
-			throw BinderException("blobcache_config: writer_threads cannot exceed 256");
+		if (nr_io_threads > 256) {
+			throw BinderException("blobcache_config: nr_io_threads cannot exceed 256");
 		}
 	}
 
@@ -124,20 +125,8 @@ static unique_ptr<FunctionData> BlobCacheConfigBind(ClientContext &context, Tabl
 		regex_patterns = StringValue::Get(patterns_val);
 	}
 
-	if (input.inputs.size() >= 5) {
-		if (input.inputs[4].IsNull()) {
-			throw BinderException("blobcache_config: small_range_threshold cannot be NULL");
-		}
-		auto threshold_val = input.inputs[4];
-		if (threshold_val.type().id() != LogicalTypeId::BIGINT && threshold_val.type().id() != LogicalTypeId::INTEGER) {
-			throw BinderException("blobcache_config: small_range_threshold must be an integer");
-		}
-		small_range_threshold = threshold_val.GetValue<idx_t>();
-		// Allow 0 to disable small-range cache (all ranges go to large cache)
-	}
-
-	return make_uniq<BlobCacheConfigBindData>(std::move(directory), max_size_mb, writer_threads,
-	                                          std::move(regex_patterns), small_range_threshold, query_only);
+	return make_uniq<BlobCacheConfigBindData>(std::move(directory), max_size_mb, nr_io_threads,
+	                                          std::move(regex_patterns), query_only);
 }
 
 // Init function for blobcache_config global state
@@ -157,33 +146,31 @@ static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, Table
                                                    vector<LogicalType> &return_types, vector<string> &names) {
 	// Setup return schema - returns cache statistics with 11 columns
 	return_types.push_back(LogicalType::VARCHAR); // protocol
-	return_types.push_back(LogicalType::VARCHAR); // filename
+	return_types.push_back(LogicalType::VARCHAR); // uri
 	return_types.push_back(LogicalType::VARCHAR); // cache_type
-	return_types.push_back(LogicalType::VARCHAR); // blobcache_file
-	return_types.push_back(LogicalType::BIGINT);  // blobcache_range_start
-	return_types.push_back(LogicalType::BIGINT);  // range_start
-	return_types.push_back(LogicalType::BIGINT);  // range_size
+	return_types.push_back(LogicalType::VARCHAR); // file
+	return_types.push_back(LogicalType::BIGINT);  // file_range_start
+	return_types.push_back(LogicalType::BIGINT);  // uri_range_start
+	return_types.push_back(LogicalType::BIGINT);  // uri_range_size
 	return_types.push_back(LogicalType::BIGINT);  // usage_count
 	return_types.push_back(LogicalType::BIGINT);  // bytes_from_cache
 	return_types.push_back(LogicalType::BIGINT);  // bytes_from_mem
-	return_types.push_back(LogicalType::BIGINT);  // smallrange_id
 
 	names.push_back("protocol");
-	names.push_back("filename");
+	names.push_back("uri");
 	names.push_back("cache_type");
-	names.push_back("blobcache_file");
-	names.push_back("blobcache_range_start");
-	names.push_back("range_start");
-	names.push_back("range_size");
+	names.push_back("file");
+	names.push_back("file_range_start");
+	names.push_back("uri_range_start");
+	names.push_back("uri_range_size");
 	names.push_back("usage_count");
 	names.push_back("bytes_from_cache");
 	names.push_back("bytes_from_mem");
-	names.push_back("smallrange_id");
 
 	return nullptr; // No bind data needed for stats function
 }
 
-// blobcache_config(directory, max_size_mb, writer_threads) - Configure the blob cache
+// blobcache_config(directory, max_size_mb, nr_io_threads) - Configure the blob cache
 static void BlobCacheConfigFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &global_state = data_p.global_state->Cast<BlobCacheGlobalState>();
 
@@ -213,14 +200,14 @@ static void BlobCacheConfigFunction(ClientContext &context, TableFunctionInput &
 		} else {
 			// Configuration mode - actually configure the cache
 			DUCKDB_LOG_DEBUG(*context.db,
-			                 "[BlobCache] Configuring cache: directory='%s', max_size=%zu MB, writer_threads=%zu, "
-			                 "regex_patterns='%s', small_range_threshold=%zu",
-			                 bind_data.directory.c_str(), bind_data.max_size_mb, bind_data.writer_threads,
-			                 bind_data.regex_patterns.c_str(), bind_data.smallrange_threshold);
+			                 "[BlobCache] Configuring cache: directory='%s', max_size=%zu MB, nr_io_threads=%zu, "
+			                 "regex_patterns='%s'",
+			                 bind_data.directory.c_str(), bind_data.max_size_mb, bind_data.nr_io_threads,
+			                 bind_data.regex_patterns.c_str());
 
 			// Configure cache first (including small_range_threshold)
 			shared_cache->ConfigureCache(bind_data.directory, bind_data.max_size_mb * 1024 * 1024,
-			                             bind_data.writer_threads, bind_data.smallrange_threshold);
+			                             bind_data.nr_io_threads);
 
 			// Update regex patterns and purge non-qualifying cache entries
 			shared_cache->UpdateRegexPatterns(bind_data.regex_patterns);
@@ -231,12 +218,12 @@ static void BlobCacheConfigFunction(ClientContext &context, TableFunctionInput &
 	}
 
 	// Get current cache statistics (works whether configuration succeeded or not)
-	if (shared_cache && shared_cache->config.blobcache_initialized) {
-		cache_path = shared_cache->config.blobcache_dir;
-		max_size_bytes = shared_cache->config.total_cache_capacity;
+	if (shared_cache && shared_cache->state.blobcache_initialized) {
+		cache_path = shared_cache->state.blobcache_dir;
+		max_size_bytes = shared_cache->state.total_cache_capacity;
 		current_size_bytes = shared_cache->smallrange_blobcache->current_cache_size +
 		                     shared_cache->largerange_blobcache->current_cache_size;
-		writer_threads = shared_cache->num_io_threads;
+		writer_threads = shared_cache->nr_io_threads;
 	}
 
 	// Return the statistics tuple
@@ -244,7 +231,7 @@ static void BlobCacheConfigFunction(ClientContext &context, TableFunctionInput &
 	output.data[0].SetValue(0, Value(cache_path));                 // cache_path
 	output.data[1].SetValue(0, Value::BIGINT(max_size_bytes));     // max_size_bytes
 	output.data[2].SetValue(0, Value::BIGINT(current_size_bytes)); // current_size_bytes
-	output.data[3].SetValue(0, Value::BIGINT(writer_threads));     // writer_threads
+	output.data[3].SetValue(0, Value::BIGINT(writer_threads));     // nr_io_threads
 	output.data[4].SetValue(0, Value::BOOLEAN(success));           // success
 	global_state.tuples_processed = 1;
 }
@@ -276,16 +263,15 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 	for (idx_t i = 0; i < chunk_size; i++) {
 		const auto &info = stats[offset + i];
 		output.data[0].SetValue(i, Value(info.protocol));
-		output.data[1].SetValue(i, Value(info.filename));
+		output.data[1].SetValue(i, Value(info.uri));
 		output.data[2].SetValue(i, Value(cache_type));
-		output.data[3].SetValue(i, Value(info.blobcache_file));
-		output.data[4].SetValue(i, Value::BIGINT(info.blobcache_range_start));
-		output.data[5].SetValue(i, Value::BIGINT(info.range_start));
-		output.data[6].SetValue(i, Value::BIGINT(info.range_size));
+		output.data[3].SetValue(i, Value(info.file));
+		output.data[4].SetValue(i, Value::BIGINT(info.file_range_start));
+		output.data[5].SetValue(i, Value::BIGINT(info.uri_range_start));
+		output.data[6].SetValue(i, Value::BIGINT(info.uri_range_size));
 		output.data[7].SetValue(i, Value::BIGINT(info.usage_count));
 		output.data[8].SetValue(i, Value::BIGINT(info.bytes_from_cache));
 		output.data[9].SetValue(i, Value::BIGINT(info.bytes_from_mem));
-		output.data[10].SetValue(i, Value::BIGINT(info.smallrange_id));
 	}
 	global_state.tuples_processed += chunk_size;
 }
@@ -305,42 +291,42 @@ static void BlobCachePrefetchFunction(DataChunk &args, ExpressionState &state, V
 	auto &db = *context.db;
 	auto cache = GetOrCreateBlobCache(db);
 
-	if (!cache->config.blobcache_initialized) {
+	if (!cache->state.blobcache_initialized) {
 		// Cache not initialized - mark all as failed
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 		ConstantVector::SetNull(result, true);
 		return;
 	}
 
-	auto &filename_vec = args.data[0];
+	auto &uri_vec = args.data[0];
 	auto &start_vec = args.data[1];
 	auto &size_vec = args.data[2];
 	auto count = args.size();
 
 	// Flatten vectors to process them
-	UnifiedVectorFormat filename_data, start_data, size_data;
-	filename_vec.ToUnifiedFormat(count, filename_data);
+	UnifiedVectorFormat uri_data, start_data, size_data;
+	uri_vec.ToUnifiedFormat(count, uri_data);
 	start_vec.ToUnifiedFormat(count, start_data);
 	size_vec.ToUnifiedFormat(count, size_data);
 
-	auto filename_ptr = UnifiedVectorFormat::GetData<string_t>(filename_data);
+	auto uri_ptr = UnifiedVectorFormat::GetData<string_t>(uri_data);
 	auto start_ptr = UnifiedVectorFormat::GetData<int64_t>(start_data);
 	auto size_ptr = UnifiedVectorFormat::GetData<int64_t>(size_data);
 
-	// Group ranges by filename and concatenate nearby ranges
+	// Group ranges by uri and concatenate nearby ranges
 	unordered_map<string, vector<PrefetchRange>> ranges_by_file;
 
 	for (idx_t i = 0; i < count; i++) {
-		auto filename_idx = filename_data.sel->get_index(i);
+		auto uri_idx = uri_data.sel->get_index(i);
 		auto start_idx = start_data.sel->get_index(i);
 		auto size_idx = size_data.sel->get_index(i);
 
-		if (!filename_data.validity.RowIsValid(filename_idx) || !start_data.validity.RowIsValid(start_idx) ||
+		if (!uri_data.validity.RowIsValid(uri_idx) || !start_data.validity.RowIsValid(start_idx) ||
 		    !size_data.validity.RowIsValid(size_idx)) {
 			continue; // Skip null rows
 		}
 
-		string filename = filename_ptr[filename_idx].GetString();
+		string uri = uri_ptr[uri_idx].GetString();
 		idx_t range_start = start_ptr[start_idx];
 		idx_t range_size = size_ptr[size_idx];
 
@@ -348,7 +334,7 @@ static void BlobCachePrefetchFunction(DataChunk &args, ExpressionState &state, V
 			continue;
 		}
 
-		auto &ranges = ranges_by_file[filename];
+		auto &ranges = ranges_by_file[uri];
 		PrefetchRange new_range = {range_start, range_start + range_size, range_size};
 
 		// Try to concatenate with the last range
@@ -369,14 +355,14 @@ static void BlobCachePrefetchFunction(DataChunk &args, ExpressionState &state, V
 
 	// Queue all concatenated ranges as async read jobs for parallel execution
 	for (auto &entry : ranges_by_file) {
-		const string &filename = entry.first;
+		const string &uri = entry.first;
 		auto &ranges = entry.second;
-		string cache_key = cache->config.GenCacheKey(filename);
+		string key = cache->state.GenCacheKey(uri);
 
 		for (auto &range : ranges) {
 			idx_t bytes_to_read = range.end - range.start;
 			// Queue read job to IO threads - will be executed in parallel
-			cache->QueueIORead(filename, cache_key, range.start, bytes_to_read);
+			cache->QueueIORead(uri, key, range.start, bytes_to_read);
 		}
 	}
 
@@ -439,9 +425,11 @@ void BlobcacheExtension::Load(ExtensionLoader &loader) {
 	DUCKDB_LOG_DEBUG(instance, "[BlobCache] Registered blobcache_prefetch function");
 
 	/// create an initial cache
+	idx_t max_size_mb, nr_io_threads;
+	default_cache_sizes(instance, max_size_mb, nr_io_threads);
 	auto shared_cache = GetOrCreateBlobCache(instance);
-	shared_cache->config.path_sep = instance.GetFileSystem().PathSeparator("");
-	shared_cache->ConfigureCache(".blobcache");
+	shared_cache->state.path_sep = instance.GetFileSystem().PathSeparator("");
+	shared_cache->ConfigureCache(".blobcache", max_size_mb * 1024 * 1024, nr_io_threads);
 
 	// Register extension callback for automatic wrapping
 	config.extension_callbacks.push_back(make_uniq<BlobCacheExtensionCallback>());
