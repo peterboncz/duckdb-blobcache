@@ -360,9 +360,12 @@ static void BlobCachePrefetchFunction(DataChunk &args, ExpressionState &state, V
 		string key = cache->state.GenCacheKey(uri);
 
 		for (auto &range : ranges) {
-			idx_t bytes_to_read = range.end - range.start;
-			// Queue read job to IO threads - will be executed in parallel
-			cache->QueueIORead(uri, key, range.start, bytes_to_read);
+			BlobCacheReadJob job;
+			job.key = key;
+			job.uri = uri;
+			job.range_start = range.start;
+			job.range_size = range.end - range.start;
+			cache->QueueIORead(job); // Queue read job to IO threads - will be executed in parallel
 		}
 	}
 

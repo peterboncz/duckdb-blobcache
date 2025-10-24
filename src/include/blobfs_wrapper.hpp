@@ -45,7 +45,7 @@ public:
 	               shared_ptr<BlobCache> cache)
 	    : FileHandle(fs, wrapped_handle->GetPath(), wrapped_handle->GetFlags()),
 	      wrapped_handle(std::move(wrapped_handle)), cache(cache), uri(std::move(original_path)), key(std::move(key)),
-	      file_position(0), prev_smallrange() {
+	      file_position(0) {
 	}
 
 	~BlobFileHandle() override = default;

@@ -2,19 +2,10 @@
 
 namespace duckdb {
 
-//===----------------------------------------------------------------------===//
-// Helper to check if a range is stale (its CacheFile has been deleted)
-//===----------------------------------------------------------------------===//
-static bool IsRangeStale(const BlobCacheFileRange &range,
-                         const unordered_map<string, unique_ptr<BlobCacheFile>> &file_cache) {
-	if (range.file.empty()) {
-		return false;
-	}
+static inline bool IsRangeStale(const BlobCacheFileRange &range,
+                                const unordered_map<string, unique_ptr<BlobCacheFile>> &file_cache) {
 	auto cache_file_it = file_cache.find(range.file);
-	if (cache_file_it != file_cache.end()) {
-		return cache_file_it->second->deleted;
-	}
-	return true; // CacheFile not found in map - it has been evicted, so this range is stale
+	return (cache_file_it == file_cache.end()); // file was deleted
 }
 
 //===----------------------------------------------------------------------===//
@@ -38,10 +29,7 @@ BlobCacheFileRange *AnalyzeRange(BlobCacheMap &map, const string &key, const str
 					blobcache_entry->ranges.erase(prev_it);
 					continue; // Stale range found (CacheFile has been deleted) - delete it and loop again
 				}
-				// Range is usable if: (1) memcache_buffer exists (in ExternalFileCache), OR (2) disk write completed
-				bool has_memcache = prev_range->memcache_buffer != nullptr;
-				bool disk_complete = prev_range->disk_write_completed.load(std::memory_order_acquire);
-				if (has_memcache || disk_complete) {
+				if (prev_range->disk_write_completed) {
 					hit_range = prev_range.get();
 				}
 			}
@@ -65,6 +53,7 @@ idx_t BlobCache::ReadFromCache(const string &key, const string &uri, idx_t pos, 
 	BlobCacheFileRange *hit_range = nullptr;
 	idx_t orig_len = len, off = pos, hit_size = 0;
 
+	// check the small and large range caches (where appropriate) if the prefix of this request is cached
 	std::unique_lock<std::mutex> lock(blobcache_mutex);
 	auto map = smallrange_blobcache.get();
 	if (len < BlobCacheState::SMALL_RANGE_THRESHOLD) {
@@ -81,7 +70,9 @@ idx_t BlobCache::ReadFromCache(const string &key, const string &uri, idx_t pos, 
 		lock.unlock();
 		return 0;
 	}
-	// the read we want to do at 'pos' finds a hit of its 'len' first bytes in 'hit_range'
+
+	// the read we want to do at 'pos' finds a hit of its 'hit_size' first bytes in 'hit_range'
+	// it may have reduced the following non-cached read until 'len' to a next cached range
 	hit_range->bytes_from_cache += hit_size;
 	hit_range->usage_count++;
 	auto cache_file_it = map->file_cache->find(hit_range->file);
@@ -92,11 +83,10 @@ idx_t BlobCache::ReadFromCache(const string &key, const string &uri, idx_t pos, 
 	// save the critical values before unlock (after unlock, hit_range* might get deallocated in an concurrent evict)
 	string file = hit_range->file;
 	idx_t uri_range_start = hit_range->uri_range_start;
-	idx_t uri_range_end = hit_range->uri_range_end;
 	idx_t file_pos = hit_range->file_range_start + (pos - uri_range_start);
 	lock.unlock();
 
-	// Read from cache file unlocked
+	// Read from on-dick cache file unlocked
 	idx_t bytes_from_mem = 0;
 	if (!map->ReadFromCacheFile(file, file_pos, buf, hit_size, bytes_from_mem)) {
 		return 0; // Read failed
@@ -119,7 +109,7 @@ idx_t BlobCache::ReadFromCache(const string &key, const string &uri, idx_t pos, 
 // we had to read from the original source (e.g. S3). Now try to cache this buffer in the disk-based blobcache
 void BlobCache::InsertCache(const string &key, const string &uri, idx_t pos, idx_t len, void *buf) {
 	if (!state.blobcache_initialized || len == 0 || len > state.total_cache_capacity) {
-		return;
+		return; // bail out if non initialized or impossible length
 	}
 	BlobCacheType cache_type = // Determine blobcache type based on original request size
 	    (len < BlobCacheState::SMALL_RANGE_THRESHOLD) ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
@@ -144,7 +134,7 @@ void BlobCache::InsertCache(const string &key, const string &uri, idx_t pos, idx
 		return; // nothing to cache
 	}
 
-	if (!EvictToCapacity(cache_type, final_size)) {
+	if (!EvictToCapacity(cache_type, final_size)) { // make sure we have room for 'final_bytes' extra data
 		state.LogError("InsertCache: EvictToCapacity failed for " + to_string(final_size) +
 		               " bytes (cache_type=" + (cache_type == BlobCacheType::LARGE_RANGE ? "large" : "small") +
 		               ", large_size=" + to_string(largerange_blobcache->current_cache_size) +
@@ -152,7 +142,7 @@ void BlobCache::InsertCache(const string &key, const string &uri, idx_t pos, idx
 		return; // failed to make room
 	}
 
-	// allocate a buffer and copy the data into it (possibly merged with prev)
+	// allocate a buffer and copy the data into it
 	BufferHandle buffer_handle;
 	if (!state.AllocateInMemCache(buffer_handle, final_size)) {
 		state.LogError("InsertRangeInternal: AllocateInMemCache failed for " + to_string(final_size) + " bytes");
@@ -171,28 +161,29 @@ void BlobCache::InsertCache(const string &key, const string &uri, idx_t pos, idx
 		return;
 	}
 
-	// Create new range and update stats
-	auto new_range = make_uniq<BlobCacheFileRange>(range_start, range_end);
-	auto range_ptr = new_range.get();
-	range_ptr->file = cache_file->file; // Store path for lookup in file_cache
-	cache_entry->ranges[range_start] = std::move(new_range);
+	// Create file_buffer and new_range. They refer to each other..
+	auto new_range = make_uniq<BlobCacheFileRange>(*cache_file, range_start, range_end);
+	idx_t file_range_start = new_range->file_range_start;    // Capture before moving new_range
+	cache_entry->ranges[range_start] = std::move(new_range); // transfer ownership to map
+
+	// update stats
+	cache_file->file_size += final_size;
 	cache_entry->total_cached_size += final_size;
 	blobcache_map.current_cache_size += final_size;
 	blobcache_map.nr_ranges++;
 
-	// Pre-compute file_range_start (offset in CacheFile where this range will be written)
-	range_ptr->file_range_start = cache_file->file_size;
-	cache_file->file_size += final_size;
-
-	// Register this cached piece in the memcache
-	state.InsertRangeIntoMemcache(cache_file->file, range_ptr->file_range_start, buffer_handle, final_size);
-
 	// Schedule the disk write, using thread partitioning based on file_id
-	auto file_buffer = duckdb::make_shared_ptr<BlobCacheFileBuffer>(std::move(buffer_handle), final_size, key, uri);
-	file_buffer->disk_write_completed_ptr = &range_ptr->disk_write_completed;
-	range_ptr->memcache_buffer = file_buffer;
-	idx_t partition = cache_file->file_id % nr_io_threads;
-	QueueIOWrite(cache_file->file, partition, file_buffer);
+	cache_file->ongoing_writes++;
+	BlobCacheWriteJob job;
+	job.file = cache_file->file;
+	job.handle = std::move(buffer_handle);
+	job.nr_bytes = final_size;
+	job.disk_write_completed_ptr = &cache_entry->ranges[range_start]->disk_write_completed;
+
+	// Register in memcache AFTER moving handle to job (memcache stores BlockHandle which stays valid)
+	state.InsertRangeIntoMemcache(cache_file->file, file_range_start, job.handle, final_size);
+
+	QueueIOWrite(job, cache_file->file_id % nr_io_threads);
 }
 
 //===----------------------------------------------------------------------===//
@@ -244,20 +235,20 @@ bool BlobCacheState::TryReadFromMemcache(const string &file, idx_t range_start, 
 // Multi-threaded background cache writer implementation
 //===----------------------------------------------------------------------===//
 
-void BlobCache::QueueIOWrite(const string &path, idx_t partition, duckdb::shared_ptr<BlobCacheFileBuffer> buf) {
+void BlobCache::QueueIOWrite(BlobCacheWriteJob &job, idx_t partition) {
 	{
 		std::lock_guard<std::mutex> lock(io_mutexes[partition]);
-		write_queues[partition].emplace(path, buf);
+		write_queues[partition].emplace(std::move(job));
 	}
 	io_cvs[partition].notify_one();
 }
 
-void BlobCache::QueueIORead(const string &uri, const string &key, idx_t range_start, idx_t range_size) {
+void BlobCache::QueueIORead(BlobCacheReadJob &job) {
 	// Round-robin assignment across all threads (no partitioning needed for reads)
 	idx_t target_thread = read_job_counter.fetch_add(1, std::memory_order_relaxed) % nr_io_threads;
 	{
 		std::lock_guard<std::mutex> lock(io_mutexes[target_thread]);
-		read_queues[target_thread].emplace(uri, key, range_start, range_size);
+		read_queues[target_thread].emplace(std::move(job));
 	}
 	io_cvs[target_thread].notify_one();
 }
@@ -304,7 +295,7 @@ void BlobCache::StopIOThreads() {
 	nr_io_threads = 0; // Reset thread count
 }
 
-void BlobCache::ProcessWriteJob(const BlobCacheWriteJob &job) {
+void BlobCache::ProcessWriteJob(BlobCacheWriteJob &job) {
 	// Determine cache type from uri format:
 	// Small: /cachedir/{2hex}/small{id}
 	// Large: /cachedir/{2hex}/{2hex}/{13hex}{uri_range_start}_{file_id}{suffix}
@@ -314,22 +305,32 @@ void BlobCache::ProcessWriteJob(const BlobCacheWriteJob &job) {
 	    StringUtil::StartsWith(uri_part, "small") ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
 	BlobCacheMap &cache = GetCacheMap(cache_type);
 
-	idx_t range_start;
-	if (cache.WriteToCacheFile(job.file, job.buf->handle.Ptr(), job.buf->size, range_start)) {
-		// Mark disk write as completed via backpointer
-		job.buf->disk_write_completed_ptr->store(true, std::memory_order_release);
-		// Unpin the buffer now that write is complete - allows buffer manager to evict if needed
-		job.buf->Unpin();
+	bool write_success = cache.WriteToCacheFile(job.file, job.handle.Ptr(), job.nr_bytes);
+	if (write_success) {
+		*job.disk_write_completed_ptr = true; // Safe: ongoing_writes prevents CacheFile eviction
 	} else {
-		// Write failed - log error (memcache has stale data, but eviction is unsafe from background thread)
-		state.LogError("ProcessWriteJob: failed to write '" + job.file + "'");
+		state.LogError("ProcessWriteJob: write failed for '" + job.file + "' - removing file");
+	}
+	job.handle.Destroy(); // Unpin buffer - allows buffer manager to evict if needed
+
+	// Decrement ongoing_writes and handle failures under mutex
+	std::lock_guard<std::mutex> lock(blobcache_mutex);
+	// Look up the CacheFile to decrement ongoing_writes
+	auto file_it = cache.file_cache->find(job.file);
+	if (file_it == cache.file_cache->end()) { // not found??
+		state.LogError("ProcessWriteJob: '" + job.file + "' was found missing while having " +
+		               to_string(file_it->second->ongoing_writes) + " ongoing writes");
+	} else if (write_success) { // normal path
+		file_it->second->ongoing_writes--;
+	} else { // Write failed - must delete CacheFile as partial writes would corrupt file offsets
+		cache.RemoveCacheFile(file_it->second.get());
 	}
 }
 
-void BlobCache::ProcessReadJob(const BlobCacheReadJob &job) {
+void BlobCache::ProcessReadJob(BlobCacheReadJob &job) {
 	try {
 		// Open file and allocate buffer
-		auto &fs = state.GetFileSystem();
+		auto &fs = FileSystem::GetFileSystem(*state.db_instance);
 		auto handle = fs.OpenFile(job.uri, FileOpenFlags::FILE_FLAGS_READ);
 		auto buffer = unique_ptr<char[]>(new char[job.range_size]);
 
@@ -385,12 +386,10 @@ BlobCacheFile *BlobCacheMap::GetOrCreateCacheFile(BlobCacheEntry *cache_entry, c
 		auto file_it = file_cache->find(file);
 		if (file_it != file_cache->end()) {
 			auto cache_file = file_it->second.get();
-			if (!cache_file->deleted.load()) { // ok, we can append to this existing CacheFile
-				cache_entry->total_cached_size += range_size;
-				TouchLRU(cache_file);
-				state.LogDebug("GetOrCreateCacheFile: append range of " + to_string(range_size) + " to " + file);
-				return cache_file;
-			}
+			cache_entry->total_cached_size += range_size;
+			TouchLRU(cache_file);
+			state.LogDebug("GetOrCreateCacheFile: append range of " + to_string(range_size) + " to " + file);
+			return cache_file;
 		}
 	}
 	// Create a new CacheFile
@@ -413,41 +412,27 @@ bool BlobCacheMap::EvictToCapacity(idx_t required_space) {
 	idx_t freed_space = 0;
 	auto *current = lru_tail; // Start from least recently used
 	idx_t files_checked = 0;
-	idx_t files_skipped_empty = 0;
 	idx_t files_skipped_excluded = 0;
 	idx_t max_files = file_cache->size() + 1; // Safety limit to prevent infinite loops
 
 	while (required_space > freed_space && current && files_checked < max_files) {
 		files_checked++;
-		// Check if this CacheFile was already deleted (shouldn't happen, but safety check)
-		if (current->deleted.load(std::memory_order_acquire)) {
+
+		// Skip files with ongoing writes
+		if (current->ongoing_writes > 0) {
+			files_skipped_excluded++;
 			current = current->lru_prev;
 			continue;
 		}
+
 		// Save next candidate before we potentially evict current
 		auto *next_to_try = current->lru_prev;
 
-		// Evict this CacheFile
+		// Evict this CacheFile using helper method
 		idx_t evicted_bytes = current->file_size;
-		string file = current->file;
+		RemoveCacheFile(current);
+		freed_space += evicted_bytes;
 
-		// Mark as deleted (ranges will be cleaned up lazily by AnalyzeRange)
-		current->deleted = true;
-
-		// Remove from LRU and file_cache
-		RemoveFromLRU(current);
-		file_cache->erase(file);
-
-		// Delete the physical file
-		if (DeleteCacheFile(file)) {
-			freed_space += evicted_bytes;
-			current_cache_size -= std::min<idx_t>(current_cache_size, evicted_bytes);
-			state.LogDebug("EvictToCapacity: evicted CacheFile '" + file + "' freeing " +
-			               std::to_string(evicted_bytes) + " bytes");
-		} else {
-			state.LogError("EvictToCapacity: failed to delete file '" + file + "'");
-			// Continue trying other files even if deletion failed
-		}
 		current = next_to_try; // Move to next file in LRU
 	}
 
@@ -462,7 +447,6 @@ bool BlobCacheMap::EvictToCapacity(idx_t required_space) {
 		    "EvictToCapacity: needed " + std::to_string(required_space) + " bytes but only freed " +
 		    std::to_string(freed_space) + " bytes (current_cache_size=" + std::to_string(current_cache_size) +
 		    ", total_files=" + std::to_string(total_files) + "', files_checked=" + std::to_string(files_checked) +
-		    ", files_skipped_empty=" + std::to_string(files_skipped_empty) +
 		    ", files_skipped_excluded=" + std::to_string(files_skipped_excluded) +
 		    ", lru_head=" + (lru_head ? "present" : "null") + ", lru_tail=" + (lru_tail ? "present" : "null") + ")");
 		return false;
@@ -513,7 +497,7 @@ unique_ptr<FileHandle> BlobCacheMap::TryOpenCacheFile(const string &file) {
 		return nullptr;
 	}
 	try {
-		auto &fs = state.GetFileSystem();
+		auto &fs = FileSystem::GetFileSystem(*state.db_instance);
 		return fs.OpenFile(file, FileOpenFlags::FILE_FLAGS_READ);
 	} catch (const std::exception &e) {
 		// File was evicted between metadata check and open - this is expected
@@ -541,7 +525,8 @@ bool BlobCacheMap::ReadFromCacheFile(const string &file, idx_t blobcache_range_s
 	}
 	auto buffer_ptr = buffer_handle.Ptr();
 	try {
-		state.GetFileSystem().Read(*handle, buffer_ptr, length, blobcache_range_start); // Read from disk into buffer
+		auto &fs = FileSystem::GetFileSystem(*state.db_instance);
+		fs.Read(*handle, buffer_ptr, length, blobcache_range_start); // Read from disk into buffer
 	} catch (const std::exception &e) {
 		// File was evicted/deleted after opening but before reading - signal cache miss to fall back to original source
 		buffer_handle.Destroy();
@@ -554,13 +539,12 @@ bool BlobCacheMap::ReadFromCacheFile(const string &file, idx_t blobcache_range_s
 	return true;
 }
 
-bool BlobCacheMap::WriteToCacheFile(const string &file, const void *buffer, idx_t length,
-                                    idx_t &blobcache_range_start) {
+bool BlobCacheMap::WriteToCacheFile(const string &file, const void *buffer, idx_t length) {
 	if (!state.db_instance) {
 		return false;
 	}
 	try {
-		auto &fs = state.GetFileSystem();
+		auto &fs = FileSystem::GetFileSystem(*state.db_instance);
 		auto flags = // Open file for writing in append mode (create if not exists)
 		    FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE | FileOpenFlags::FILE_FLAGS_APPEND;
 		auto handle = fs.OpenFile(file, flags);
@@ -569,7 +553,6 @@ bool BlobCacheMap::WriteToCacheFile(const string &file, const void *buffer, idx_
 			return false;
 		}
 		// Get current file size to know where we're appending
-		blobcache_range_start = static_cast<idx_t>(fs.GetFileSize(*handle));
 		int64_t bytes_written = fs.Write(*handle, const_cast<void *>(buffer), length);
 		handle->Close(); // Close handle explicitly
 		if (bytes_written != static_cast<int64_t>(length)) {
@@ -588,13 +571,31 @@ bool BlobCacheMap::DeleteCacheFile(const string &file) {
 	if (!state.db_instance)
 		return false;
 	try {
-		auto &fs = state.GetFileSystem();
+		auto &fs = FileSystem::GetFileSystem(*state.db_instance);
 		fs.RemoveFile(file);
 		state.LogDebug("DeleteCacheFile: deleted file '" + file + "'");
 		return true;
 	} catch (const std::exception &e) {
 		state.LogError("DeleteCacheFile: failed to delete file '" + file + "': " + string(e.what()));
 		return false;
+	}
+}
+
+void BlobCacheMap::RemoveCacheFile(BlobCacheFile *cache_file) {
+	// Note: This must be called with blobcache_mutex held
+	// Remove from LRU, file_cache map, and delete physical file
+	idx_t evicted_bytes = cache_file->file_size;
+	string file = cache_file->file;
+
+	RemoveFromLRU(cache_file);
+	file_cache->erase(file);
+
+	if (DeleteCacheFile(file)) {
+		current_cache_size -= std::min<idx_t>(current_cache_size, evicted_bytes);
+		state.LogDebug("RemoveCacheFile: removed CacheFile '" + file + "' freeing " + std::to_string(evicted_bytes) +
+		               " bytes");
+	} else {
+		state.LogError("RemoveCacheFile: failed to delete file '" + file + "'");
 	}
 }
 
@@ -663,15 +664,13 @@ void BlobCacheState::EnsureDirectoryExists(const string &key, BlobCacheType type
 	if (subdir_created.test(bitset_idx)) {
 		return;
 	}
-
-	auto &fs = GetFileSystem();
-
 	// Create XX/ directory (may already exist if created for different YY)
 	std::ostringstream xx_oss;
 	xx_oss << std::hex << std::uppercase << std::setw(2) << std::setfill('0') << (int)xx;
 	string xx_dir = blobcache_dir + xx_oss.str();
 
 	try {
+		auto &fs = FileSystem::GetFileSystem(*db_instance);
 		if (!fs.DirectoryExists(xx_dir)) {
 			fs.CreateDirectory(xx_dir);
 		}
@@ -835,7 +834,7 @@ bool BlobCache::ShouldCacheFile(const string &uri, optional_ptr<FileOpener> open
 bool BlobCacheState::CleanCacheDir() {
 	if (!db_instance)
 		return false;
-	auto &fs = GetFileSystem();
+	auto &fs = FileSystem::GetFileSystem(*db_instance);
 	if (!fs.DirectoryExists(blobcache_dir)) {
 		return true; // Directory doesn't exist, nothing to clean
 	}
@@ -886,7 +885,7 @@ bool BlobCacheState::InitCacheDir() {
 	if (!db_instance) {
 		return false;
 	}
-	auto &fs = GetFileSystem();
+	auto &fs = FileSystem::GetFileSystem(*db_instance);
 	if (!fs.DirectoryExists(blobcache_dir)) {
 		try {
 			fs.CreateDirectory(blobcache_dir);
