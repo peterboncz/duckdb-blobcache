@@ -644,19 +644,18 @@ void BlobCacheState::EnsureDirectoryExists(const string &key, BlobCacheType type
 	if (subdir_created.test(idx)) { // avoid race: some thread may just have created it
 		return;
 	}
-	std::ostringstream dir;
-	dir << blobcache_dir << std::hex << std::uppercase << std::setw(3) << std::setfill('0') << xxx;
+	auto dir = blobcache_dir + key.substr(0, 3);
 	if (type == BlobCacheType::LARGE_RANGE) {
-		dir << path_sep << std::hex << std::uppercase << std::setw(2) << std::setfill('0') << yy;
+		dir += path_sep + key.substr(3, 2);
 	}
 	try {
 		auto &fs = FileSystem::GetFileSystem(*db_instance);
-		if (!fs.DirectoryExists(dir.str())) {
-			fs.CreateDirectory(dir.str());
+		if (!fs.DirectoryExists(dir)) {
+			fs.CreateDirectory(dir);
 		}
 		subdir_created.set(idx);
 	} catch (const std::exception &e) {
-		LogError("EnsureDirectoryExists: failed to mkdir " + dir.str() + " for key '" + key + "': " + string(e.what()));
+		LogError("EnsureDirectoryExists: failed to mkdir " + dir + " for key '" + key + "': " + string(e.what()));
 	}
 }
 
