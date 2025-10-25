@@ -2,8 +2,6 @@
 # description: test blobcache extension
 # group: [sql]
 
-load __TEST_DIR__/blobtest.db
-
 require blobcache
 
 require parquet
@@ -22,14 +20,10 @@ statement ok
 copy lineitem to 'lineitem.parquet';
 
 statement ok
-copy (select 42 as message where message=0) to 'mylog0.csv';
-
-statement ok
-call enable_logging(level='error', storage_path = 'mylog1.csv');
-
-query I
-select message from read_csv('mylog[02].csv', ignore_errors=true)
-----
+call enable_logging(level='error');
 
 statement ok
 select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
+
+query I
+select message from duckdb_logs;
