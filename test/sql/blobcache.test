@@ -25,12 +25,11 @@ statement ok
 select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
 
 statement ok
-select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
-
-statement ok
 call disable_logging();
 
 query I
 from read_csv('mylog.csv', delim = '|')
 ----
 
+statement ok
+select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
