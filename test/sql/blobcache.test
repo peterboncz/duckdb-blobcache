@@ -20,7 +20,7 @@ statement ok
 copy lineitem to 'lineitem.parquet';
 
 statement ok
-call enable_logging(level='error', storage_path = '/tmp/mylog.csv');
+call enable_logging(level='error', storage_path = 'mylog.csv');
 
 statement ok
 select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
@@ -33,4 +33,10 @@ small	16	1
 
 statement ok
 select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
+
+restart
+
+query I
+from read_csv('mylog.csv', delim = '|')
+----
 
