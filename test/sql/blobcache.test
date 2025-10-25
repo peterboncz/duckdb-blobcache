@@ -27,6 +27,9 @@ select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
 statement ok
 call disable_logging();
 
+statement ok
+call enable_logging(level='error', storage_path = 'otherlog.csv');
+
 query I
 from read_csv('mylog.csv', delim = '|')
 ----
