@@ -130,7 +130,7 @@ struct BlobCacheState {
 		}
 	}
 
-	// key(uri) = hex_hash64 ':' uri_suffix15 ':' protocol
+	// key(uri) = hex_hash64 '_' uri_suffix15 '_' protocol
 	// goals: (i) 'unique' id, (ii) high character diversity at start of name, (iii) descriptive to aid debugging
 	string GenCacheKey(const string &uri) const {
 		const idx_t len = uri.length();
@@ -140,8 +140,8 @@ struct BlobCacheState {
 		hash_t hash_value = Hash(string_t(uri.c_str(), static_cast<uint32_t>(len)));
 		std::stringstream hex_stream;
 		hex_stream << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << hash_value;
-		return hex_stream.str() + ":" + uri.substr(std::max<idx_t>((slash != string::npos) * (slash + 1), suffix)) +
-		       ":" + ((protocol != string::npos) ? StringUtil::Lower(uri.substr(0, protocol)) : "unknown");
+		return hex_stream.str() + "_" + uri.substr(std::max<idx_t>((slash != string::npos) * (slash + 1), suffix)) +
+		       "_" + ((protocol != string::npos) ? StringUtil::Lower(uri.substr(0, protocol)) : "unknown");
 	}
 };
 
