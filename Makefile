@@ -7,10 +7,5 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
-# Override test to use debug build for development
-test: test_debug
-
-test_release: test_release_mine
-
-test_release_mine: test_release_internal
+.exit:
 	cat mylog.csv
