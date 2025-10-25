@@ -22,6 +22,15 @@ statement ok
 select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
 
 statement ok
+call enable_logging(level='error', storage_path = 'mylog.csv');
+
+query III
+select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
+----
+large	16	0
+small	16	1
+
+statement ok
 select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
 
 query III
@@ -102,3 +111,7 @@ query I
 select count(*) > 0 from blobcache_stats();
 ----
 1
+
+query II
+from read_csv('mylog.csv', delim = '§')
+----
