@@ -20,7 +20,7 @@ statement ok
 copy lineitem to 'lineitem.parquet';
 
 statement ok
-call enable_logging(level='error', storage_path = 'mylog.csv');
+call enable_logging(level='error', storage_path = '/tmp/mylog.csv');
 
 statement ok
 select max(l_comment) from read_parquet('fakes3://lineitem.parquet');

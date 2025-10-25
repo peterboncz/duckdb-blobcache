@@ -3,4 +3,5 @@
 # group: [sql]
 
 query I
-from read_csv('mylog.csv', delim = '|')
+from read_csv('/tmp/mylog.csv', delim = '|')
+----
