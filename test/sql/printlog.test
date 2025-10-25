@@ -1,0 +1,6 @@
+# name: test/sql/printlog.test
+# description: post-test blobcache extension
+# group: [sql]
+
+query I
+from read_csv('mylog.csv', delim = '|')
