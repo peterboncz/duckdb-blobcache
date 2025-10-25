@@ -19,10 +19,10 @@ statement ok
 copy lineitem to 'lineitem.parquet';
 
 statement ok
-select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
+call enable_logging(level='error', storage_path = 'mylog.csv');
 
 statement ok
-call enable_logging(level='error', storage_path = 'mylog.csv');
+select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
 
 statement ok
 select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
