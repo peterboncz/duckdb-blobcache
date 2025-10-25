@@ -20,13 +20,13 @@ statement ok
 copy lineitem to 'lineitem.parquet';
 
 statement ok
-copy (select 42 as message where message=0) to 'mylog.csv';
+copy (select 42 as message where message=0) to 'mylog0.csv';
 
 statement ok
 call enable_logging(level='error', storage_path = 'mylog2.csv');
 
 query I
-select message from read_csv('mylog*.csv', ignore_errors=true)
+select message from read_csv('mylog[01].csv', ignore_errors=true)
 ----
 
 statement ok
