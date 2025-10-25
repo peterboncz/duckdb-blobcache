@@ -637,8 +637,11 @@ void BlobCacheState::EnsureDirectoryExists(const string &key, BlobCacheType type
 	idx_t yy = std::stoi(key.substr(3, 2), nullptr, 16);
 	idx_t idx = xxx + 4096 * ((type == BlobCacheType::LARGE_RANGE) ? yy + 1 : 0);
 
+	if (subdir_created.test(idx)) { // quick test before lock
+		return;
+	}
 	std::lock_guard<std::mutex> lock(subdir_mutex);
-	if (subdir_created.test(idx)) {
+	if (subdir_created.test(idx)) { // avoid race: some thread may just have created it
 		return;
 	}
 	std::ostringstream dir;
