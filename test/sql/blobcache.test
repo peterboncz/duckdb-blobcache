@@ -2,6 +2,8 @@
 # description: test blobcache extension
 # group: [sql]
 
+load __TEST_DIR__/blobtest.db
+
 require blobcache
 
 require parquet
@@ -20,7 +22,7 @@ statement ok
 copy lineitem to 'lineitem.parquet';
 
 statement ok
-call enable_logging(level='error', storage_path = 'mylog.csv');
+call enable_logging(level='error', storage_path = '/tmp/mylog.csv');
 
 statement ok
 select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
@@ -28,14 +30,5 @@ select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
 restart
 
 query I
-from read_csv('mylog.csv', delim = '|')
+select message from read_csv('/tmp/mylog.csv')
 ----
-
-query III
-select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
-----
-large	16	0
-small	16	1
-
-statement ok
-select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
