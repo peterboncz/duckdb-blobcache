@@ -112,6 +112,6 @@ select count(*) > 0 from blobcache_stats();
 ----
 1
 
-query II
-from read_csv('mylog.csv', delim = '§')
+query I
+from read_csv('mylog.csv', delim = '|')
 ----
