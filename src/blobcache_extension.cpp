@@ -345,7 +345,8 @@ static void BlobCachePrefetchFunction(DataChunk &args, ExpressionState &state, V
 			// Concatenate if concatenated_size seems cheaper to fetch than the two unconcatenated ranges
 			if (EstimateS3(concatenated_size) < EstimateS3(last.original_size) + EstimateS3(new_range.original_size)) {
 				last.end = new_range.end;
-				last.original_size = last.original_size + new_range.original_size;;
+				last.original_size = last.original_size + new_range.original_size;
+				;
 				continue;
 			}
 		}
