@@ -15,6 +15,9 @@
 #include <iomanip>
 #include <thread>
 
+// inspired on AnyBlob paper: lowest latency is 20ms, transfer 12MB/s for the first MB, 40MB/s beyond that
+#define EstimateS3(nr_bytes) ((nr_bytes < (1 << 20)) ? (20 + ((80 * nr_bytes) >> 20)) : (75 + ((25 * nr_bytes) >> 20)))
+
 namespace duckdb {
 
 // Forward declarations

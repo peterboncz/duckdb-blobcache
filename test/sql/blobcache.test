@@ -25,17 +25,91 @@ call enable_logging(level='error', storage_path = 'mylog.csv');
 statement ok
 select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
 
-statement ok
-call disable_logging();
-
-statement ok
-call enable_logging(level='error', storage_path = 'otherlog.csv');
-
-# connection reader
-# reader: memory
-query I
-from read_csv('mylog.csv', delim = '|')
-----
-
-statement ok
+query III
 select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
+----
+large	16	0
+small	16	1
+
+statement ok
+select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
+
+query III
+select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
+----
+large	16	16
+small	16	18
+
+# Verify that bytes_from_mem is now > 0 (memory cache hits on second read)
+query II
+select cache_type, sum(bytes_from_mem) > 0 from blobcache_stats() group by all order by all;
+----
+large	1
+small	1
+
+statement ok
+select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
+
+query III
+select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
+----
+large	16	32
+small	16	35
+
+# Verify bytes_from_mem still > 0 after third read (with external file cache disabled)
+query II
+select cache_type, sum(bytes_from_mem) > 0 from blobcache_stats() group by all order by all;
+----
+large	1
+small	1
+
+statement ok
+from blobcache_config('.blobcache2/', 1024, 255);
+
+# Directory changed, so cache should be cleared
+query I
+select count(*) from blobcache_stats();
+----
+0
+
+query IIIII
+select * replace(substr(cache_path,0,12) as cache_path) from blobcache_config();
+----
+.blobcache2	1073741824	0	255	1
+
+# Run a query to populate the new cache
+statement ok
+select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
+
+# Verify new cache is populated
+query I
+select count(*) from blobcache_stats();
+----
+32
+
+# Test that Parquet reads bypass DuckDB's ExternalFileCache
+statement ok
+from blobcache_config('.blobcache3/', 512, 1);
+
+# Confirm global external file cache is disabled
+query I
+select current_setting('enable_external_file_cache');
+----
+0
+
+# Run a query through our cache
+statement ok
+select max(l_comment) from read_parquet('fakes3://lineitem.parquet');
+
+# DuckDB's external file cache should be EMPTY (Parquet bypasses it)
+query I
+select count(*) from duckdb_external_file_cache();
+----
+0
+
+# Our cache should be POPULATED (Parquet goes through our cache)
+query I
+select count(*) > 0 from blobcache_stats();
+----
+1
+

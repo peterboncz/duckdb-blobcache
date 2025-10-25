@@ -46,9 +46,7 @@ static idx_t ReadChunk(duckdb::FileSystem &wrapped_fs, BlobFileHandle &handle, c
 		handle.cache->InsertCache(handle.key, handle.uri, location + nr_cached, nr_read, buf + nr_cached);
 
 		if (nr_read && StringUtil::StartsWith(handle.uri, "fakes3://")) {
-			// inspired on AnyBlob paper: lowest latency is 20ms, transfer 12MB/s for the first MB, 40MB/s beyond that
-			uint64_t ms = (nr_read < (1 << 20)) ? (20 + ((80 * nr_read) >> 20)) : (75 + ((25 * nr_read) >> 20));
-			std::this_thread::sleep_for(std::chrono::milliseconds(ms)); // simulate S3 latency
+			std::this_thread::sleep_for(std::chrono::milliseconds(EstimateS3(nr_read))); // simulate S3 latency
 		}
 	}
 	handle.file_position = location + len; // move file position

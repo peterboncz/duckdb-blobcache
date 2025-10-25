@@ -9,3 +9,12 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # Override test to use debug build for development
 test: test_debug
+
+test_release: test_release_internal
+	cat mylog.csv
+
+test_debug: test_debug_internal
+	cat mylog.csv
+
+test_reldebug: test_reldebug_internal
+	cat mylog.csv

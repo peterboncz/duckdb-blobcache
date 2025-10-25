@@ -341,12 +341,11 @@ static void BlobCachePrefetchFunction(DataChunk &args, ExpressionState &state, V
 		if (!ranges.empty()) {
 			auto &last = ranges.back();
 			idx_t concatenated_size = new_range.end - last.start;
-			idx_t original_sum = last.original_size + new_range.original_size;
 
-			// Concatenate if concatenated_size < 2x the sum of original sizes
-			if (concatenated_size < 2 * original_sum) {
+			// Concatenate if concatenated_size seems cheaper to fetch than the two unconcatenated ranges
+			if (EstimateS3(concatenated_size) < EstimateS3(last.original_size) + EstimateS3(new_range.original_size)) {
 				last.end = new_range.end;
-				last.original_size = original_sum;
+				last.original_size = last.original_size + new_range.original_size;;
 				continue;
 			}
 		}
