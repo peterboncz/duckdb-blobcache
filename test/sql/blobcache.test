@@ -6,6 +6,7 @@ require blobcache
 
 require parquet
 
+# connection main
 statement ok
 install tpch
 
@@ -30,6 +31,8 @@ call disable_logging();
 statement ok
 call enable_logging(level='error', storage_path = 'otherlog.csv');
 
+# connection reader
+# reader: memory
 query I
 from read_csv('mylog.csv', delim = '|')
 ----
