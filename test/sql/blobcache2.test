@@ -2,8 +2,6 @@
 # description: test blobcache extension
 # group: [sql]
 
-load __TEST_DIR__/blobtest.db
-
 require blobcache
 
 require parquet
@@ -25,10 +23,10 @@ statement ok
 copy (select 42 as message where message=0) to 'mylog.csv';
 
 statement ok
-call enable_logging(level='error', storage_path = 'mylog1.csv');
+call enable_logging(level='error', storage_path = 'mylog2.csv');
 
 query I
-select message from read_csv('mylog*.csv', ignore_errors=true)
+select message from read_csv('mylog1.csv', ignore_errors=true)
 ----
 
 statement ok
