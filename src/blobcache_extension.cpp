@@ -149,9 +149,9 @@ static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, Table
 	return_types.push_back(LogicalType::VARCHAR); // uri
 	return_types.push_back(LogicalType::VARCHAR); // cache_type
 	return_types.push_back(LogicalType::VARCHAR); // file
-	return_types.push_back(LogicalType::BIGINT);  // file_range_start
-	return_types.push_back(LogicalType::BIGINT);  // uri_range_start
-	return_types.push_back(LogicalType::BIGINT);  // uri_range_size
+	return_types.push_back(LogicalType::BIGINT);  // range_start_file
+	return_types.push_back(LogicalType::BIGINT);  // range_start_uri
+	return_types.push_back(LogicalType::BIGINT);  // range_size
 	return_types.push_back(LogicalType::BIGINT);  // usage_count
 	return_types.push_back(LogicalType::BIGINT);  // bytes_from_cache
 	return_types.push_back(LogicalType::BIGINT);  // bytes_from_mem
@@ -160,9 +160,9 @@ static unique_ptr<FunctionData> BlobCacheStatsBind(ClientContext &context, Table
 	names.push_back("uri");
 	names.push_back("cache_type");
 	names.push_back("file");
-	names.push_back("file_range_start");
-	names.push_back("uri_range_start");
-	names.push_back("uri_range_size");
+	names.push_back("range_start_file");
+	names.push_back("range_start_uri");
+	names.push_back("range_size");
 	names.push_back("usage_count");
 	names.push_back("bytes_from_cache");
 	names.push_back("bytes_from_mem");
@@ -221,8 +221,8 @@ static void BlobCacheConfigFunction(ClientContext &context, TableFunctionInput &
 	if (shared_cache && shared_cache->state.blobcache_initialized) {
 		cache_path = shared_cache->state.blobcache_dir;
 		max_size_bytes = shared_cache->state.total_cache_capacity;
-		current_size_bytes = shared_cache->smallrange_blobcache->current_cache_size +
-		                     shared_cache->largerange_blobcache->current_cache_size;
+		current_size_bytes =
+		    shared_cache->smallrange_map->current_cache_size + shared_cache->largerange_map->current_cache_size;
 		writer_threads = shared_cache->nr_io_threads;
 	}
 
@@ -244,8 +244,8 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 	if (global_state.tuples_processed == 0) {
 		auto cache = GetOrCreateBlobCache(*context.db);
 		std::lock_guard<std::mutex> lock(cache->blobcache_mutex);
-		global_state.smallrange_stats = cache->smallrange_blobcache->GetStatistics();
-		global_state.largerange_stats = cache->largerange_blobcache->GetStatistics();
+		global_state.smallrange_stats = cache->smallrange_map->GetStatistics();
+		global_state.largerange_stats = cache->largerange_map->GetStatistics();
 	}
 
 	// Determine which cache to serve from
@@ -266,9 +266,9 @@ static void BlobCacheStatsFunction(ClientContext &context, TableFunctionInput &d
 		output.data[1].SetValue(i, Value(info.uri));
 		output.data[2].SetValue(i, Value(cache_type));
 		output.data[3].SetValue(i, Value(info.file));
-		output.data[4].SetValue(i, Value::BIGINT(info.file_range_start));
-		output.data[5].SetValue(i, Value::BIGINT(info.uri_range_start));
-		output.data[6].SetValue(i, Value::BIGINT(info.uri_range_size));
+		output.data[4].SetValue(i, Value::BIGINT(info.range_start_file));
+		output.data[5].SetValue(i, Value::BIGINT(info.range_start_uri));
+		output.data[6].SetValue(i, Value::BIGINT(info.range_size));
 		output.data[7].SetValue(i, Value::BIGINT(info.usage_count));
 		output.data[8].SetValue(i, Value::BIGINT(info.bytes_from_cache));
 		output.data[9].SetValue(i, Value::BIGINT(info.bytes_from_mem));

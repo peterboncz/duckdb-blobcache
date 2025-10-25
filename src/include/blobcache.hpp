@@ -57,7 +57,6 @@ struct BlobCacheFileRange {
 
 struct BlobCacheEntry {
 	string uri;                                        // full URL of the blob
-	idx_t total_cached_size = 0;                       // Total bytes disk-cached for this blob
 	map<idx_t, unique_ptr<BlobCacheFileRange>> ranges; // Map of start position to BlobCacheFileRanges
 };
 
@@ -75,12 +74,15 @@ struct BlobCacheState {
 	string blobcache_dir;                 // where we store data temporarilu
 	idx_t total_cache_capacity = 0;
 
+	// smallrange cache appends all small ranges into files of 256KB
+	idx_t current_smallrange_file_size = 256 * 1024; // mark it full initially
+	string current_smallrange_file;
+
 	// Memory cache for disk-cached files (our own ExternalFileCache instance)
 	unique_ptr<ExternalFileCache> blobfile_memcache;
 
-	// Directory creation tracking (65536 = 256*256 for XX/YY directories)
-	mutable std::mutex subdir_mutex;   // Protects subdir_created bitset
-	std::bitset<65536> subdir_created; // Track which XX/YY subdirectories exist
+	mutable std::mutex subdir_mutex;               // Protects subdir_created bitset
+	std::bitset<4096 + 4096 * 256> subdir_created; // 4096 (small XXX) + 4096*256 (large XXX/YY)
 	void EnsureDirectoryExists(const string &key, BlobCacheType type);
 
 	// Memory cache helpers
@@ -111,23 +113,17 @@ struct BlobCacheState {
 	bool CleanCacheDir(); // empty cache directory (remove all files and subdirs)
 	bool InitCacheDir();  // If the directory does not exist, create it, otherwise empty it
 	// Naming scheme:
-	// Small files:  /blobcache_dir/XX/smallFILE_ID
-	// Large files:  /blobcache_dir/XX/YY/key_suffix
+	// Small files:  /blobcache_dir/XXX/smallFILE_ID
+	// Large files:  /blobcache_dir/XXX/YY/key_suffix
 	string GenCacheFilePath(idx_t file_id, const string &key, BlobCacheType type, idx_t range_start = 0) const {
 		std::ostringstream oss;
-
-		if (type == BlobCacheType::SMALL_RANGE) {
-			// Small files: XX/smallFILE_ID
-			// Use first 2 hex chars of key for XX subdirectory
-			string xx = key.substr(0, 2);
-			return blobcache_dir + xx + path_sep + "small" + to_string(file_id);
-		} else {
-			// Large range: XX/YY/key_suffix
-			// Use first 4 hex chars of key for XX/YY subdirectories
-			string xx = key.substr(0, 2);
-			string yy = key.substr(2, 2);
+		string xxx = key.substr(0, 3);
+		if (type == BlobCacheType::SMALL_RANGE) { // Small files: XXX/smallFILE_ID
+			return blobcache_dir + xxx + path_sep + "small" + to_string(file_id);
+		} else { // Large range: XXX/YY/key_suffix
+			string yy = key.substr(3, 2);
 			oss << range_start << "_" << file_id;
-			return blobcache_dir + xx + path_sep + yy + path_sep + key.substr(4, 12) + oss.str() + key.substr(16);
+			return blobcache_dir + xxx + path_sep + yy + path_sep + key.substr(5, 11) + oss.str() + key.substr(16);
 		}
 	}
 
@@ -151,9 +147,9 @@ struct BlobCacheRangeInfo {
 	string protocol;        // e.g., s3
 	string uri;             // Blob that we have cached a range of
 	string file;            // Disk file where this range is stored in the cache
-	idx_t file_range_start; // Offset in cache file where this range starts
-	idx_t uri_range_start;  // Start position in blob of this range
-	idx_t uri_range_size;   // Size of range (end - start in remote file)
+	idx_t range_start_file; // Offset in cache file where this range starts
+	idx_t range_start_uri;  // Start position in blob of this range
+	idx_t range_size;       // Size of range (end - start in remote file)
 	idx_t usage_count;      // how often it was read from the cache
 	idx_t bytes_from_cache; // disk bytes read from CacheFile
 	idx_t bytes_from_mem;   // memory bytes read from this cached range
@@ -257,11 +253,12 @@ struct BlobCacheMap {
 
 // BlobCacheWriteJob - async write job for disk persistence
 struct BlobCacheWriteJob {
-	BufferHandle handle;            // Buffer containing data to write
-	string file;                    // Cache file path to write to
-	idx_t nr_bytes;                 // number of bytes to write
-	bool *disk_write_completed_ptr; // Backpointer to BlobCacheFileRange::disk_write_completed (safe because
-	                                // ongoing_writes prevents eviction)
+	BufferHandle handle;      // Buffer containing data to write
+	string file;              // Cache file path to write to
+	idx_t nr_bytes;           // number of bytes to write
+	BlobCacheType cache_type; // small or large range-cache
+	// Backpointer to BlobCacheFileRange::disk_write_completed (safe because ongoing_writes prevents eviction)
+	bool *disk_write_completed_ptr;
 };
 
 // BlobCacheReadJob - async read job for prefetching
@@ -282,7 +279,7 @@ struct BlobCache {
 
 	// Cache maps for small and large ranges
 	mutable std::mutex blobcache_mutex; // Protects both caches, LRU lists, sizes
-	unique_ptr<BlobCacheMap> smallrange_blobcache, largerange_blobcache;
+	unique_ptr<BlobCacheMap> smallrange_map, largerange_map;
 
 	// Cached regex patterns for file filtering (updated via callback)
 	mutable std::mutex regex_mutex;    // Protects cached regex state
@@ -300,17 +297,17 @@ struct BlobCache {
 
 	// Helper methods for accessing cache and capacity by type
 	BlobCacheMap &GetCacheMap(BlobCacheType type) {
-		return type == BlobCacheType::SMALL_RANGE ? *smallrange_blobcache : *largerange_blobcache;
+		return type == BlobCacheType::SMALL_RANGE ? *smallrange_map : *largerange_map;
 	}
 	idx_t GetCacheCapacity(BlobCacheType type) const {
 		return (type == BlobCacheType::LARGE_RANGE)
 		           ? static_cast<idx_t>(state.total_cache_capacity * 0.9) // Large cache gets 90% of total capacity
-		           : state.total_cache_capacity - largerange_blobcache->current_cache_size; // small cache gets rest
+		           : state.total_cache_capacity - largerange_map->current_cache_size; // small cache gets rest
 	}
 
 	// Constructor/Destructor
 	explicit BlobCache(DatabaseInstance *db_instance = nullptr)
-	    : smallrange_blobcache(make_uniq<BlobCacheMap>(state)), largerange_blobcache(make_uniq<BlobCacheMap>(state)),
+	    : smallrange_map(make_uniq<BlobCacheMap>(state)), largerange_map(make_uniq<BlobCacheMap>(state)),
 	      shutdown_io_threads(false), read_job_counter(0), nr_io_threads(1) {
 		if (db_instance) {
 			state.db_instance = db_instance->shared_from_this();
@@ -347,8 +344,8 @@ struct BlobCache {
 			return;
 		}
 		std::lock_guard<std::mutex> lock(blobcache_mutex);
-		smallrange_blobcache->EvictFile(uri);
-		largerange_blobcache->EvictFile(uri);
+		smallrange_map->EvictFile(uri);
+		largerange_map->EvictFile(uri);
 	}
 };
 

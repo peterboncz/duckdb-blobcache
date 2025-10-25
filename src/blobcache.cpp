@@ -55,12 +55,12 @@ idx_t BlobCache::ReadFromCache(const string &key, const string &uri, idx_t pos, 
 
 	// check the small and large range caches (where appropriate) if the prefix of this request is cached
 	std::unique_lock<std::mutex> lock(blobcache_mutex);
-	auto map = smallrange_blobcache.get();
+	auto map = smallrange_map.get();
 	if (len < BlobCacheState::SMALL_RANGE_THRESHOLD) {
 		hit_range = AnalyzeRange(*map, key, uri, off, len); // may adjust len downward to match a next range
 	}
 	if (!hit_range) {
-		map = largerange_blobcache.get();
+		map = largerange_map.get();
 		hit_range = AnalyzeRange(*map, key, uri, off, len); // may adjust len downward to match a next range
 	}
 	if (hit_range) {
@@ -133,12 +133,11 @@ void BlobCache::InsertCache(const string &key, const string &uri, idx_t pos, idx
 	if (final_size == 0) {
 		return; // nothing to cache
 	}
-
 	if (!EvictToCapacity(cache_type, final_size)) { // make sure we have room for 'final_bytes' extra data
 		state.LogError("InsertCache: EvictToCapacity failed for " + to_string(final_size) +
 		               " bytes (cache_type=" + (cache_type == BlobCacheType::LARGE_RANGE ? "large" : "small") +
-		               ", large_size=" + to_string(largerange_blobcache->current_cache_size) +
-		               ", small_size=" + to_string(smallrange_blobcache->current_cache_size) + ")");
+		               ", large_size=" + to_string(largerange_map->current_cache_size) +
+		               ", small_size=" + to_string(smallrange_map->current_cache_size) + ")");
 		return; // failed to make room
 	}
 
@@ -161,14 +160,13 @@ void BlobCache::InsertCache(const string &key, const string &uri, idx_t pos, idx
 		return;
 	}
 
-	// Create file_buffer and new_range. They refer to each other..
+	// Create a new BlobCacheFileRange and put it in the BlobCacheEntry
 	auto new_range = make_uniq<BlobCacheFileRange>(*cache_file, range_start, range_end);
 	idx_t file_range_start = new_range->file_range_start;    // Capture before moving new_range
 	cache_entry->ranges[range_start] = std::move(new_range); // transfer ownership to map
 
 	// update stats
 	cache_file->file_size += final_size;
-	cache_entry->total_cached_size += final_size;
 	blobcache_map.current_cache_size += final_size;
 	blobcache_map.nr_ranges++;
 
@@ -178,11 +176,10 @@ void BlobCache::InsertCache(const string &key, const string &uri, idx_t pos, idx
 	job.file = cache_file->file;
 	job.handle = std::move(buffer_handle);
 	job.nr_bytes = final_size;
+	job.cache_type = cache_type;
 	job.disk_write_completed_ptr = &cache_entry->ranges[range_start]->disk_write_completed;
 
-	// Register in memcache AFTER moving handle to job (memcache stores BlockHandle which stays valid)
 	state.InsertRangeIntoMemcache(cache_file->file, file_range_start, job.handle, final_size);
-
 	QueueIOWrite(job, cache_file->file_id % nr_io_threads);
 }
 
@@ -296,15 +293,9 @@ void BlobCache::StopIOThreads() {
 }
 
 void BlobCache::ProcessWriteJob(BlobCacheWriteJob &job) {
-	// Determine cache type from uri format:
-	// Small: /cachedir/{2hex}/small{id}
-	// Large: /cachedir/{2hex}/{2hex}/{13hex}{uri_range_start}_{file_id}{suffix}
 	size_t last_sep = job.file.find_last_of(state.path_sep);
 	string uri_part = job.file.substr(last_sep + 1);
-	BlobCacheType cache_type =
-	    StringUtil::StartsWith(uri_part, "small") ? BlobCacheType::SMALL_RANGE : BlobCacheType::LARGE_RANGE;
-	BlobCacheMap &cache = GetCacheMap(cache_type);
-
+	BlobCacheMap &cache = GetCacheMap(job.cache_type);
 	bool write_success = cache.WriteToCacheFile(job.file, job.handle.Ptr(), job.nr_bytes);
 	if (write_success) {
 		*job.disk_write_completed_ptr = true; // Safe: ongoing_writes prevents CacheFile eviction
@@ -313,13 +304,11 @@ void BlobCache::ProcessWriteJob(BlobCacheWriteJob &job) {
 	}
 	job.handle.Destroy(); // Unpin buffer - allows buffer manager to evict if needed
 
-	// Decrement ongoing_writes and handle failures under mutex
+	// Look up the CacheFile to decrement ongoing_writes under lock
 	std::lock_guard<std::mutex> lock(blobcache_mutex);
-	// Look up the CacheFile to decrement ongoing_writes
 	auto file_it = cache.file_cache->find(job.file);
 	if (file_it == cache.file_cache->end()) { // not found??
-		state.LogError("ProcessWriteJob: '" + job.file + "' was found missing while having " +
-		               to_string(file_it->second->ongoing_writes) + " ongoing writes");
+		state.LogError("ProcessWriteJob: '" + job.file + "' was found missing while having ongoing writes");
 	} else if (write_success) { // normal path
 		file_it->second->ongoing_writes--;
 	} else { // Write failed - must delete CacheFile as partial writes would corrupt file offsets
@@ -381,12 +370,12 @@ void BlobCache::MainIOThreadLoop(idx_t thread_id) {
 BlobCacheFile *BlobCacheMap::GetOrCreateCacheFile(BlobCacheEntry *cache_entry, const string &key,
                                                   BlobCacheType cache_type, idx_t range_size) {
 	// Note: Must be called with blobcache_mutex held
-	if (cache_type == BlobCacheType::SMALL_RANGE && cache_entry->total_cached_size + range_size <= 256 * 1024) {
-		auto file = state.GenCacheFilePath(current_file_id, key, cache_type);
+	if (cache_type == BlobCacheType::SMALL_RANGE && state.current_smallrange_file_size + range_size < 256 * 1024) {
+		auto file = state.current_smallrange_file;
 		auto file_it = file_cache->find(file);
 		if (file_it != file_cache->end()) {
 			auto cache_file = file_it->second.get();
-			cache_entry->total_cached_size += range_size;
+			state.current_smallrange_file_size += range_size;
 			TouchLRU(cache_file);
 			state.LogDebug("GetOrCreateCacheFile: append range of " + to_string(range_size) + " to " + file);
 			return cache_file;
@@ -394,6 +383,10 @@ BlobCacheFile *BlobCacheMap::GetOrCreateCacheFile(BlobCacheEntry *cache_entry, c
 	}
 	// Create a new CacheFile
 	auto file = state.GenCacheFilePath(++current_file_id, key, cache_type);
+	if (cache_type == BlobCacheType::SMALL_RANGE) {
+		state.current_smallrange_file_size = 0;
+		state.current_smallrange_file = file;
+	}
 	auto new_cache_file = make_uniq<BlobCacheFile>(file, current_file_id);
 	auto cache_file_ptr = new_cache_file.get();
 	(*file_cache)[file] = std::move(new_cache_file);
@@ -418,13 +411,11 @@ bool BlobCacheMap::EvictToCapacity(idx_t required_space) {
 	while (required_space > freed_space && current && files_checked < max_files) {
 		files_checked++;
 
-		// Skip files with ongoing writes
-		if (current->ongoing_writes > 0) {
+		if (current->ongoing_writes > 0) { // Skip files with ongoing writes
 			files_skipped_excluded++;
 			current = current->lru_prev;
 			continue;
 		}
-
 		// Save next candidate before we potentially evict current
 		auto *next_to_try = current->lru_prev;
 
@@ -476,9 +467,9 @@ BlobCacheMap::GetStatistics() const { // produce list of cached ranges for blobc
 				continue;
 			}
 			info.file = range_pair.second->file;
-			info.file_range_start = range_pair.second->file_range_start;
-			info.uri_range_start = range_pair.second->uri_range_start;
-			info.uri_range_size = range_pair.second->uri_range_end - range_pair.second->uri_range_start;
+			info.range_start_file = range_pair.second->file_range_start;
+			info.range_start_uri = range_pair.second->uri_range_start;
+			info.range_size = range_pair.second->uri_range_end - range_pair.second->uri_range_start;
 			info.usage_count = range_pair.second->usage_count;
 			info.bytes_from_cache = range_pair.second->bytes_from_cache;
 			info.bytes_from_mem = range_pair.second->bytes_from_mem;
@@ -622,9 +613,8 @@ bool BlobCache::EvictToCapacity(BlobCacheType cache_type, idx_t new_range_size) 
 	auto result = true;
 	if (cache_type == BlobCacheType::LARGE_RANGE) {
 		idx_t large_cap = GetCacheCapacity(BlobCacheType::LARGE_RANGE);
-		if (largerange_blobcache->current_cache_size + new_range_size > large_cap) {
-			if (!largerange_blobcache->EvictToCapacity(largerange_blobcache->current_cache_size + new_range_size -
-			                                           large_cap)) {
+		if (largerange_map->current_cache_size + new_range_size > large_cap) {
+			if (!largerange_map->EvictToCapacity(largerange_map->current_cache_size + new_range_size - large_cap)) {
 				result = false;
 			} else {
 				new_range_size = 0; // we have made space, but still will check small cache
@@ -632,9 +622,8 @@ bool BlobCache::EvictToCapacity(BlobCacheType cache_type, idx_t new_range_size) 
 		}
 	}
 	idx_t small_cap = GetCacheCapacity(BlobCacheType::SMALL_RANGE);
-	if (smallrange_blobcache->current_cache_size + new_range_size > small_cap) {
-		result &= smallrange_blobcache->EvictToCapacity(smallrange_blobcache->current_cache_size + new_range_size -
-		                                                small_cap);
+	if (smallrange_map->current_cache_size + new_range_size > small_cap) {
+		result &= smallrange_map->EvictToCapacity(smallrange_map->current_cache_size + new_range_size - small_cap);
 	}
 	return result;
 }
@@ -644,52 +633,27 @@ bool BlobCache::EvictToCapacity(BlobCacheType cache_type, idx_t new_range_size) 
 //===----------------------------------------------------------------------===//
 
 void BlobCacheState::EnsureDirectoryExists(const string &key, BlobCacheType type) {
-	// Extract the first 2 hex chars (XX) for all types
-	// For large ranges, also extract next 2 hex chars (YY)
-	uint8_t xx = std::stoi(key.substr(0, 2), nullptr, 16);
-	uint8_t yy = (type == BlobCacheType::LARGE_RANGE) ? std::stoi(key.substr(2, 2), nullptr, 16) : 0;
+	idx_t xxx = std::stoi(key.substr(0, 3), nullptr, 16);
+	idx_t yy = std::stoi(key.substr(3, 2), nullptr, 16);
+	idx_t idx = xxx + 4096 * ((type == BlobCacheType::LARGE_RANGE) ? yy + 1 : 0);
 
-	// Calculate bitset index: XX * 256 + YY (for small ranges, YY=0)
-	idx_t bitset_idx = (xx << 8) | yy;
-
-	// Fast path: check if already created (lock-free read)
-	if (subdir_created.test(bitset_idx)) {
-		return; // Already created
-	}
-
-	// Slow path: need to create directories
 	std::lock_guard<std::mutex> lock(subdir_mutex);
-
-	// Double-check after acquiring lock (another thread may have created it)
-	if (subdir_created.test(bitset_idx)) {
+	if (subdir_created.test(idx)) {
 		return;
 	}
-	// Create XX/ directory (may already exist if created for different YY)
-	std::ostringstream xx_oss;
-	xx_oss << std::hex << std::uppercase << std::setw(2) << std::setfill('0') << (int)xx;
-	string xx_dir = blobcache_dir + xx_oss.str();
-
+	std::ostringstream dir;
+	dir << blobcache_dir << std::hex << std::uppercase << std::setw(3) << std::setfill('0') << xxx;
+	if (type == BlobCacheType::LARGE_RANGE) {
+		dir << path_sep << std::hex << std::uppercase << std::setw(2) << std::setfill('0') << yy;
+	}
 	try {
 		auto &fs = FileSystem::GetFileSystem(*db_instance);
-		if (!fs.DirectoryExists(xx_dir)) {
-			fs.CreateDirectory(xx_dir);
+		if (!fs.DirectoryExists(dir.str())) {
+			fs.CreateDirectory(dir.str());
 		}
-
-		if (type == BlobCacheType::LARGE_RANGE) {
-			// Create XX/YY/ directory for large ranges
-			std::ostringstream yy_oss;
-			yy_oss << std::hex << std::uppercase << std::setw(2) << std::setfill('0') << (int)yy;
-			string xxyy_dir = xx_dir + path_sep + yy_oss.str();
-
-			if (!fs.DirectoryExists(xxyy_dir)) {
-				fs.CreateDirectory(xxyy_dir);
-			}
-		}
-
-		// Mark as created
-		subdir_created.set(bitset_idx);
+		subdir_created.set(idx);
 	} catch (const std::exception &e) {
-		LogError("EnsureDirectoryExists: failed to create directories for key '" + key + "': " + string(e.what()));
+		LogError("EnsureDirectoryExists: failed to mkdir " + dir.str() + " for key '" + key + "': " + string(e.what()));
 	}
 }
 
@@ -705,15 +669,15 @@ void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx
 		state.blobcache_dir = directory;
 		state.total_cache_capacity = max_size_bytes;
 
-		state.LogDebug("stateureCache: initializing cache: directory='" + state.blobcache_dir +
+		state.LogDebug("ConfigureCache: initializing cache: directory='" + state.blobcache_dir +
 		               "' max_size=" + std::to_string(state.total_cache_capacity) +
 		               " bytes io_threads=" + std::to_string(max_io_threads) +
 		               " small_threshold=" + std::to_string(BlobCacheState::SMALL_RANGE_THRESHOLD));
 		if (!state.InitCacheDir()) {
 			state.LogError("ConfigureCache: initializing cache directory='" + state.blobcache_dir + "' failed");
 		}
-		smallrange_blobcache->Clear();
-		largerange_blobcache->Clear();
+		smallrange_map->Clear();
+		largerange_map->Clear();
 		state.blobcache_initialized = true;
 		// Initialize our own ExternalFileCache instance (always enabled for memory caching)
 		state.blobfile_memcache = make_uniq<ExternalFileCache>(*state.db_instance, true);
@@ -745,8 +709,8 @@ void BlobCache::ConfigureCache(const string &base_dir, idx_t max_size_bytes, idx
 	// Clear existing cache only if directory changed or threshold changed
 	if (directory_changed) {
 		state.LogDebug("ConfigureCache: directory or threshold changed, clearing cache");
-		smallrange_blobcache->Clear();
-		largerange_blobcache->Clear();
+		smallrange_map->Clear();
+		largerange_map->Clear();
 		if (directory_changed) {
 			if (!state.CleanCacheDir()) { // Clean old directory before switching
 				state.LogError("ConfigureCache: cleaning cache directory='" + state.blobcache_dir + "' failed");
