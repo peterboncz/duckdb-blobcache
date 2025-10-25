@@ -180,7 +180,11 @@ void BlobCache::InsertCache(const string &key, const string &uri, idx_t pos, idx
 	job.disk_write_completed_ptr = &cache_entry->ranges[range_start]->disk_write_completed;
 
 	state.InsertRangeIntoMemcache(cache_file->file, file_range_start, job.handle, final_size);
-	QueueIOWrite(job, cache_file->file_id % nr_io_threads);
+	idx_t partition = 0; // small ranges are written by thread 0 (they append, so the same thread must write in order)
+	if (cache_type == BlobCacheType::LARGE_RANGE && nr_io_threads > 1) {
+		partition = cache_file->file_id % (nr_io_threads - 1); // large ranges are separate files, spread over threads
+	}
+	QueueIOWrite(job, partition);
 }
 
 //===----------------------------------------------------------------------===//

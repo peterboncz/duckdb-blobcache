@@ -27,6 +27,9 @@ call enable_logging(level='error', storage_path = 'mylog.csv');
 statement ok
 select cache_type, count(*), sum(usage_count) from blobcache_stats() group by all order by all;
 
+statement ok
+call disable_logging();
+
 query I
 from read_csv('mylog.csv', delim = '|')
 ----
