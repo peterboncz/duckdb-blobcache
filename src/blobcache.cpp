@@ -34,7 +34,7 @@ BlobCacheFileRange *AnalyzeRange(BlobCacheMap &map, const string &key, const str
 				}
 			}
 		}
-		// Check the next range to see if we need to cut short max_nr_bytes
+		// Check the next range to see if we need to reduce 'len' (to avoid reading data that we already cached)
 		if (it != blobcache_entry->ranges.end() && it->second) {
 			// Check if this range is stale (CacheFile has been deleted)
 			if (IsRangeStale(*it->second, *map.file_cache)) {
